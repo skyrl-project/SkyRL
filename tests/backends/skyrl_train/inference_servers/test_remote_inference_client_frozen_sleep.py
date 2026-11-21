@@ -35,6 +35,7 @@ async def test_sleep_with_frozen_requests_pauses_in_keep_mode_then_sleeps_the_al
         ),
     ]
     assert client.requests_frozen_asleep is True
+    assert client.frozen_kv_offloaded is offload_kv
     await client.resume_generation()
     assert client.requests_frozen_asleep is False
 

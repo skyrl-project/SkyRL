@@ -441,6 +441,38 @@ class TestSaveWeights:
         client.resume_generation.assert_not_called()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "enable_prefix_caching, clear_kv_cache_on_weight_sync, accepted",
+        [(True, True, True), (True, False, False), (False, True, False)],
+    )
+    async def test_frozen_colocated_sync_needs_a_prefix_cache_reset_when_the_kv_cache_is_discarded(
+        self, enable_prefix_caching, clear_kv_cache_on_weight_sync, accepted
+    ):
+        """After ``sleep_with_frozen_requests(offload_kv=False)`` the paused requests have no KV cache.
+        Only a weight sync that resets the prefix cache makes the inference engine prefill them again.
+        Any other weight sync fails before it wakes the engines."""
+        events = []
+        dispatch = self._nccl_dispatch(lambda *args, **kwargs: events.append("broadcast_done"))
+        dispatch.colocate_all = True
+        dispatch.cfg.trainer.fully_async = SimpleNamespace(
+            enabled=True, clear_kv_cache_on_weight_sync=clear_kv_cache_on_weight_sync
+        )
+        dispatch.cfg.generator.inference_engine.enable_prefix_caching = enable_prefix_caching
+        client = dispatch._inference_engine_client
+        client.requests_frozen_asleep = True
+        client.frozen_kv_offloaded = False
+        client.wake_for_weight_sync.side_effect = lambda tags: events.append(f"wake_{tags[0]}")
+        client.resume_generation.side_effect = lambda: events.append("resumed")
+
+        if accepted:
+            await dispatch.save_weights_for_sampler()
+            assert events == ["wake_weights", "broadcast_done", "wake_kv_cache", "resumed"]
+        else:
+            with pytest.raises(AssertionError, match="does not reset the prefix cache"):
+                await dispatch.save_weights_for_sampler()
+            assert events == []
+
+    @pytest.mark.asyncio
     async def test_prepare_for_weight_sync_does_not_sleep_engines_that_hold_frozen_requests(self):
         """`sleep()` aborts the in-flight requests, so the preparation must skip it."""
         from skyrl.backends.skyrl_train.workers.worker_dispatch import WorkerDispatch
