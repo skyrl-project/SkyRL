@@ -843,6 +843,26 @@ class WorkerDispatch:
         truthy, on the default path."""
         return self.colocate_all and getattr(self._inference_engine_client, "requests_frozen_asleep", False) is True
 
+    def _assert_frozen_requests_have_a_kv_cache_source(self) -> None:
+        """Reject a weight sync that would resume frozen requests on an empty KV cache.
+
+        ``sleep_with_frozen_requests(offload_kv=False)`` discards the KV cache. The paused requests
+        are then correct only when the weight sync resets the prefix cache, so that the inference
+        engine prefills them again. The condition is the one of ``Worker._should_reset_prefix_cache``.
+        The comparison with ``False`` keeps a mock client on the default path."""
+        if getattr(self._inference_engine_client, "frozen_kv_offloaded", True) is not False:
+            return
+        fully_async_cfg = self.cfg.trainer.fully_async
+        resets_prefix_cache = self.cfg.generator.inference_engine.enable_prefix_caching and (
+            not fully_async_cfg.enabled or fully_async_cfg.clear_kv_cache_on_weight_sync
+        )
+        assert resets_prefix_cache, (
+            "The inference engines sleep with frozen requests and discarded the KV cache "
+            "(offload_kv=False), but this weight sync does not reset the prefix cache. The paused requests "
+            "would continue on an empty KV cache. Set trainer.fully_async.clear_kv_cache_on_weight_sync=true "
+            "with generator.inference_engine.enable_prefix_caching=true, or sleep with offload_kv=True."
+        )
+
     def _is_lora_no_merge(self) -> bool:
         """True for the megatron LoRA path that ships standalone adapters to vLLM."""
         policy_cfg = self.cfg.trainer.policy
@@ -914,6 +934,7 @@ class WorkerDispatch:
             # paused until the KV cache is back. If the transfer fails, keep the engines asleep and
             # the requests paused: the trainer model is still on the shared GPUs, and the error
             # ends the run.
+            self._assert_frozen_requests_have_a_kv_cache_source()
             await self._inference_engine_client.wake_for_weight_sync(tags=["weights"])
             await _broadcast_and_finish()
             await self._inference_engine_client.wake_for_weight_sync(tags=["kv_cache"])
