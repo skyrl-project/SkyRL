@@ -379,11 +379,6 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 "trainer.fully_async.sample_full_batch=True requires trainer.algorithm.zero_variance_filter=True "
                 "(it is the async-native equivalent of dynamic_sampling='filter')."
             )
-            assert not self.cfg.trainer.placement.colocate_all, (
-                "trainer.fully_async.sample_full_batch=True is not supported with "
-                "trainer.placement.colocate_all=True. When an epoch runs out of prompts mid mini-batch, the loop "
-                "saves the end-of-epoch checkpoint while the inference engines are awake on the shared GPUs."
-            )
         assert (
             not self.cfg.generator.batched
         ), "batched is not supported for fully async training since a batched generate() call does not support pause/continue."
@@ -463,7 +458,9 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
 
         The default is ``False``: the checkpoint runs after eval, so the weight sync is not delayed
         while generation runs. A subclass whose inference engines share the GPUs returns ``True``,
-        so that the checkpoint runs while the engines sleep."""
+        so that the checkpoint runs while the engines sleep. The loop reads this hook once per step.
+        In both positions the checkpoint runs outside the step deadline, with its own
+        ``trainer.step_timeout_s`` budget."""
         return False
 
     async def _sync_weights_after_training_step(self) -> None:
@@ -483,7 +480,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         """Run after the last epoch and before the final checkpoint. The default does nothing."""
 
     async def _save_step_checkpoints(self, force_save: bool, is_epoch_end: bool) -> None:
-        """Write the step's checkpoint and its Hugging Face (HF) export. The loop calls this after eval.
+        """Write the step's checkpoint and its Hugging Face (HF) export.
 
         The loop writes each one at its interval, at the last step of the epoch, or when a callback
         requested a save. The loop calls it after eval, or before the weight sync when
@@ -638,6 +635,8 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 # already reflects this epoch's trained steps. The range below is just an upper bound.
                 trained_steps_this_epoch = self.async_train_dataloader.num_trained() // self.mini_batch_size
                 for _step_idx in range(self.global_step, (1 + epoch) * self.num_steps_per_epoch + 1):
+                    # Read the hook once per step, so that the step saves its checkpoint exactly once.
+                    checkpoint_first = self._checkpoint_before_weight_sync()
                     async with self._step_deadline(), Timer("step", self.all_timings):
                         self._loop_gauges.set(
                             "skyrl_gen_buffer_qsize",
@@ -721,9 +720,17 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                         is_epoch_end = trained_steps_this_epoch == self.num_steps_per_epoch
 
                         # 4. After training: pause generation, sync weights, resume.
-                        if self._checkpoint_before_weight_sync():
-                            await self._save_step_checkpoints(force_save, is_epoch_end)
-                        await self._sync_weights_after_training_step()
+                        if not checkpoint_first:
+                            await self._sync_weights_after_training_step()
+
+                    if checkpoint_first:
+                        # The checkpoint runs outside the step deadline, so it has its own
+                        # `step_timeout_s` budget, as it has after eval.
+                        await self._save_step_checkpoints(force_save, is_epoch_end)
+                        # `Timer` adds to `timing/step`, so the step time includes the weight sync here too.
+                        # No step deadline is active: `weight_sync_timeout_s` bounds the weight sync.
+                        async with Timer("step", self.all_timings):
+                            await self._sync_weights_after_training_step()
 
                     # One profiler step per async global step.
                     self._profiler_step()
@@ -747,7 +754,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                         self._fire("on_eval_end", metrics=eval_metrics)
 
                     # 7. Checkpointing. At interval, at the last step of each epoch, and when a callback asks.
-                    if not self._checkpoint_before_weight_sync():
+                    if not checkpoint_first:
                         await self._save_step_checkpoints(force_save, is_epoch_end)
 
                     log_payload = {**self.all_metrics, **{"timing/" + k: v for k, v in self.all_timings.items()}}
