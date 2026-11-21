@@ -303,13 +303,15 @@ def test_should_keep_group_token_level_rewards():
 # ---------------------------------------------------------------------------
 
 
-def test_subclass_hooks_run_in_order_around_the_step(monkeypatch):
-    """A subclass sees its hooks in this order per step: before training, training, checkpoint (when
-    ``_checkpoint_before_weight_sync`` returns ``True``), weight sync. ``_after_training_loop`` runs once,
-    before the final checkpoint."""
+def _run_two_steps_with_hooks(monkeypatch, checkpoint_first: bool):
+    """Run two training steps of a subclass that records its hooks.
+
+    Returns the order of the calls, the number of ``_checkpoint_before_weight_sync`` calls, and the
+    deadline that is active in each of the calls ``train``, ``ckpt`` and ``sync``."""
     from unittest.mock import MagicMock
 
     from skyrl.train.fully_async_trainer import FullyAsyncRayPPOTrainer
+    from skyrl.train.utils import deadline
     from tests.train.test_rl_callbacks import (
         _FAKE_CKPT_PATH,
         DummyDataset,
@@ -318,6 +320,8 @@ def test_subclass_hooks_run_in_order_around_the_step(monkeypatch):
     )
 
     order = []
+    hook_reads = []
+    deadlines = {"train": [], "ckpt": [], "sync": []}
 
     class _Hooked(FullyAsyncRayPPOTrainer):
         def _validate_placement_and_capacity(self) -> None:
@@ -327,10 +331,12 @@ def test_subclass_hooks_run_in_order_around_the_step(monkeypatch):
             order.append("before")
 
         def _checkpoint_before_weight_sync(self) -> bool:
-            return True
+            hook_reads.append(self.global_step)
+            return checkpoint_first
 
         async def _sync_weights_after_training_step(self) -> None:
             order.append("sync")
+            deadlines["sync"].append(deadline._ACTIVE.get())
 
         async def _after_training_loop(self) -> None:
             order.append("after_loop")
@@ -342,6 +348,7 @@ def test_subclass_hooks_run_in_order_around_the_step(monkeypatch):
     cfg.trainer.algorithm.policy_loss_type = "rollout_is"
     cfg.generator.batched = False
     cfg.trainer.ckpt_interval = 1
+    cfg.trainer.step_timeout_s = 1000
     tokenizer = MagicMock()
     tokenizer.pad_token_id = 0
     tokenizer.eos_token_id = 2
@@ -369,10 +376,12 @@ def test_subclass_hooks_run_in_order_around_the_step(monkeypatch):
 
     async def _train(*_args, **_kwargs):
         order.append("train")
+        deadlines["train"].append(deadline._ACTIVE.get())
         return {"policy_loss": 0.1}
 
     def _save():
         order.append("ckpt")
+        deadlines["ckpt"].append(deadline._ACTIVE.get())
         return _FAKE_CKPT_PATH
 
     monkeypatch.setattr(trainer, "_collect_generation_mini_batch", _collect)
@@ -385,6 +394,14 @@ def test_subclass_hooks_run_in_order_around_the_step(monkeypatch):
     monkeypatch.setattr(trainer._staleness_manager, "validate_state_at_epoch_end", AsyncMock(return_value=None))
 
     asyncio.run(trainer.train())
+    return order, hook_reads, deadlines
+
+
+def test_subclass_hooks_run_in_order_around_the_step(monkeypatch):
+    """A subclass sees its hooks in this order per step: before training, training, checkpoint (when
+    ``_checkpoint_before_weight_sync`` returns ``True``), weight sync. ``_after_training_loop`` runs once,
+    before the final checkpoint."""
+    order, _, _ = _run_two_steps_with_hooks(monkeypatch, checkpoint_first=True)
 
     assert order == [
         "validate",
@@ -402,32 +419,23 @@ def test_subclass_hooks_run_in_order_around_the_step(monkeypatch):
     ], order
 
 
-def test_colocate_all_rejects_sample_full_batch():
-    """An exhausted epoch saves its checkpoint while colocated inference engines are awake."""
-    from unittest.mock import MagicMock
+@pytest.mark.parametrize("checkpoint_first", [True, False])
+def test_step_checkpoint_has_its_own_deadline(monkeypatch, checkpoint_first):
+    """The step's checkpoint does not share the ``step_timeout_s`` budget of the training step, in both
+    checkpoint positions. The loop reads ``_checkpoint_before_weight_sync`` once per step."""
+    order, hook_reads, deadlines = _run_two_steps_with_hooks(monkeypatch, checkpoint_first)
 
-    from skyrl.train.fully_async_trainer import FullyAsyncRayPPOTrainer
-    from tests.train.test_rl_callbacks import DummyDataset, _build_test_cfg
+    assert hook_reads == [1, 2], hook_reads
+    step_order = ["before", "train", "ckpt", "sync"] if checkpoint_first else ["before", "train", "sync", "ckpt"]
+    assert order == ["validate", "initial_sync", *step_order, *step_order, "after_loop", "ckpt"], order
 
-    cfg = _build_test_cfg()
-    cfg.trainer.fully_async.enabled = True
-    cfg.trainer.fully_async.num_parallel_generation_workers = cfg.trainer.train_batch_size
-    cfg.trainer.policy_mini_batch_size = cfg.trainer.train_batch_size
-    cfg.trainer.algorithm.policy_loss_type = "rollout_is"
-    cfg.generator.batched = False
-    cfg.trainer.fully_async.sample_full_batch = True
-    cfg.trainer.algorithm.zero_variance_filter = True
-    cfg.trainer.placement.colocate_all = True
-    tokenizer = MagicMock()
-    tokenizer.pad_token_id = 0
-    tokenizer.eos_token_id = 2
-    with pytest.raises(AssertionError, match="sample_full_batch=True is not supported with"):
-        FullyAsyncRayPPOTrainer(
-            cfg=cfg,
-            tracker=MagicMock(),
-            tokenizer=tokenizer,
-            train_dataset=DummyDataset(size=4),
-            eval_dataset=DummyDataset(size=2),
-            inference_engine_client=None,
-            generator=MagicMock(),
-        )
+    # The third checkpoint is the final one, after the loop.
+    for train_deadline, ckpt_deadline, sync_deadline in zip(deadlines["train"], deadlines["ckpt"], deadlines["sync"]):
+        assert train_deadline is not None
+        assert ckpt_deadline is not None
+        assert ckpt_deadline is not train_deadline
+        if checkpoint_first:
+            # The step deadline is closed. The hook sets its own weight-sync deadline.
+            assert sync_deadline is None
+        else:
+            assert sync_deadline is train_deadline
