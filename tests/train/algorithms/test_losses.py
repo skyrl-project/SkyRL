@@ -193,6 +193,33 @@ def test_policy_loss_cispo_rollout_anchor():
     assert not torch.allclose(actual_loss, old_loss)
 
 
+def test_policy_loss_cispo_rollout_anchor_backward():
+    log_probs = torch.full((1, 4), -1.0, requires_grad=True)
+    old_log_probs = log_probs.detach().clone().requires_grad_()
+    rollout_logprobs = (log_probs.detach() - torch.tensor([[0.5, 1.0, 2.0, 2.0]]).log()).requires_grad_()
+    config = AlgorithmConfig(
+        cispo=CISPOConfig(cispo_eps_clip_low=0.2, cispo_eps_clip_high=0.2, cispo_anchor="rollout"),
+        policy_loss_type="cispo",
+        max_seq_len=4,
+        off_policy_correction=NULL_OFF_POLICY_CORR,
+    )
+    loss, _ = PolicyLossRegistry.get("cispo")(
+        log_probs=log_probs,
+        old_log_probs=old_log_probs,
+        rollout_logprobs=rollout_logprobs,
+        advantages=torch.tensor([[2.0, -3.0, 1.25, 4.0]]),
+        config=config,
+        loss_mask=torch.tensor([[True, True, True, False]]),
+    )
+
+    grad, old_grad, rollout_grad = torch.autograd.grad(
+        loss, (log_probs, old_log_probs, rollout_logprobs), allow_unused=True
+    )
+    torch.testing.assert_close(grad, torch.tensor([[-1.6, 3.0, -1.5, 0.0]]))
+    assert old_grad is None
+    assert rollout_grad is None
+
+
 def test_policy_loss_cispo_ratio_min_max_ignore_masked_tokens():
     """cispo/ratio_{min,max} must be computed over active tokens only.
 
