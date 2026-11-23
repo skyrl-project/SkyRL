@@ -37,6 +37,15 @@ ENV RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES=1 \
 # on by default and which needs NVIDIA's compiler. Keep Gated DeltaNet on the Triton kernels.
 ENV FLA_TILELANG=0
 
+# hipBLASLt in the ROCm 10.0.0 SDK of the parent image fails a bf16 matrix multiply at some row counts
+# (https://github.com/ROCm/rocm-libraries/issues/16517). TransformerEngine then raises
+# `HIPBLASLT Error: 6` and the trainer dies, for example Qwen3-4B with micro-batches of 4 sequences;
+# PyTorch warns and recomputes with rocBLAS. Turning off Stream-K's dynamic grid is AMD's workaround in
+# that issue: on MI355X no row count fails with it at the layer sizes of Qwen3-4B and Qwen3.5-4B, and a
+# training step takes about 5% longer.
+# ROCm 10.1 fixes hipBLASLt: remove this variable once the parent image is on ROCm 10.1.
+ENV TENSILE_STREAMK_DYNAMIC_GRID=0
+
 RUN apt-get update -y && apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
