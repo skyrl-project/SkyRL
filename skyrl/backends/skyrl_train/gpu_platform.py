@@ -14,6 +14,8 @@ import torch
 HIP_VISIBLE_DEVICES = "HIP_VISIBLE_DEVICES"
 CUDA_VISIBLE_DEVICES = "CUDA_VISIBLE_DEVICES"
 RAY_NOSET_HIP_VISIBLE_DEVICES = "RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES"
+# The attention backend SkyRL selects for vLLM engines on ROCm (default_vllm_attention_backend).
+ROCM_VLLM_ATTENTION_BACKEND = "TRITON_ATTN"
 
 
 def is_rocm() -> bool:
@@ -22,6 +24,22 @@ def is_rocm() -> bool:
     Reads a build attribute, so it is safe on a driver without a GPU and does not initialise one.
     """
     return getattr(torch.version, "hip", None) is not None
+
+
+def default_vllm_attention_backend() -> Optional[str]:
+    """Returns the attention backend SkyRL selects for a vLLM engine, or None to leave the choice to vLLM.
+
+    None on a CUDA build. ``TRITON_ATTN`` on ROCm: left to itself vLLM picks ``ROCM_ATTN`` there, and with it
+    the time to decode a token grows with the length of the context, so rollouts with long contexts
+    (multi-turn agents) run several times slower than on NVIDIA. Measured with vLLM 0.33.0 on MI355X, in
+    tokens per second at 1,000, 16,000 and 30,000 tokens of context: ``ROCM_ATTN`` 303, 61 and 35;
+    ``TRITON_ATTN`` 362, 310 and 283.
+
+    The value is a default: ``generator.inference_engine.engine_init_kwargs.attention_backend`` overrides it,
+    and null there leaves the choice to vLLM. ``TRITON_ATTN`` serves standard attention only, so a model with
+    MLA attention needs one of those two.
+    """
+    return ROCM_VLLM_ATTENTION_BACKEND if is_rocm() else None
 
 
 def ray_masks_amd_gpus(env: Optional[Mapping[str, str]] = None) -> bool:

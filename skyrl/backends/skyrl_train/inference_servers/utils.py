@@ -10,6 +10,7 @@ from skyrl.backends.skyrl_train.distributed.megatron.lora_export import (
 from skyrl.backends.skyrl_train.distributed.megatron.quantization_utils import (
     wire_to_engine_quantization,
 )
+from skyrl.backends.skyrl_train.gpu_platform import default_vllm_attention_backend
 from skyrl.backends.skyrl_train.inference_servers.new_inference_worker_wrap import (
     VLLM_NEW_INFERENCE_WORKER_EXTENSION_CLS,
 )
@@ -297,6 +298,11 @@ def _base_vllm_cli_args(model_path: str, ie_cfg: InferenceEngineConfig, seed: in
         # Other values from engine kwargs are rejected by _validate_logprobs_mode.
         logprobs_mode=VLLM_LOGPROBS_MODE,
     )
+    # On ROCm SkyRL selects the attention backend; elsewhere vLLM chooses (gpu_platform.py has the reason).
+    # Overridable via engine_init_kwargs.attention_backend below; null there leaves the choice to vLLM.
+    attention_backend = default_vllm_attention_backend()
+    if attention_backend is not None:
+        overrides["attention_backend"] = attention_backend
     for key, value in overrides.items():
         setattr(args, key, value)
 

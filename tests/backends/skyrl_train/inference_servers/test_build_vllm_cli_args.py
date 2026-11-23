@@ -192,6 +192,39 @@ def test_build_vllm_cli_args_rejects_invalid_settings(overrides, message, monkey
 
 
 @pytest.mark.vllm
+def test_attention_backend_defaults_to_triton_on_rocm_for_every_engine_role(monkeypatch):
+    import torch
+
+    monkeypatch.setattr(torch.version, "hip", "7.15.26333", raising=False)
+    cfg = SkyRLTrainConfig()
+
+    assert build_vllm_cli_args(cfg).attention_backend == "TRITON_ATTN"
+    frozen = build_frozen_vllm_cli_args("Qwen/Qwen3-32B", cfg.generator.inference_engine, seed=0)
+    assert frozen.attention_backend == "TRITON_ATTN"
+
+
+@pytest.mark.vllm
+def test_attention_backend_is_left_to_vllm_on_a_cuda_build(monkeypatch):
+    import torch
+
+    monkeypatch.setattr(torch.version, "hip", None, raising=False)
+
+    assert getattr(build_vllm_cli_args(SkyRLTrainConfig()), "attention_backend", None) is None
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize("chosen", ["ROCM_ATTN", None])
+def test_engine_init_kwargs_override_the_rocm_attention_backend(monkeypatch, chosen):
+    import torch
+
+    monkeypatch.setattr(torch.version, "hip", "7.15.26333", raising=False)
+    cfg = SkyRLTrainConfig()
+    cfg.generator.inference_engine.engine_init_kwargs = {"attention_backend": chosen}
+
+    assert build_vllm_cli_args(cfg).attention_backend == chosen  # null leaves the choice to vLLM
+
+
+@pytest.mark.vllm
 def test_default_logprobs_mode_is_processed_logprobs():
     args = build_vllm_cli_args(SkyRLTrainConfig())
 

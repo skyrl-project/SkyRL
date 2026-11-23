@@ -12,6 +12,7 @@ import torch
 
 from skyrl.backends.skyrl_train.gpu_platform import (
     check_driver_device_masks,
+    default_vllm_attention_backend,
     is_rocm,
     ray_masks_amd_gpus,
     rocm_unsupported,
@@ -33,6 +34,14 @@ def test_is_rocm_follows_the_torch_build(monkeypatch):
     assert not is_rocm()
     monkeypatch.setattr(torch.version, "hip", "7.15.26333", raising=False)
     assert is_rocm()
+
+
+def test_default_vllm_attention_backend_is_triton_on_rocm(rocm):
+    assert default_vllm_attention_backend() == "TRITON_ATTN"
+
+
+def test_default_vllm_attention_backend_leaves_the_choice_to_vllm_on_a_cuda_build(not_rocm):
+    assert default_vllm_attention_backend() is None
 
 
 @pytest.mark.parametrize(
