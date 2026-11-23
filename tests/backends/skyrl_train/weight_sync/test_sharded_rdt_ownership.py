@@ -427,6 +427,89 @@ class TestHeldNamesComposition:
         assert self._source(1, 0, names).held_names() is None
 
 
+class _MegatronGroups:
+    """A mocked ``parallel_state`` for stage-local rank ``s`` of a TP/CP/DP
+    trainer with EP experts at ETP1. Megatron's orders: dense ``tp-cp-dp`` (the
+    DP×CP group holds identical dense weights), expert ``ep-edp``, model-parallel
+    axes innermost; EDP = stage world / EP."""
+
+    def __init__(self, s, *, dp, tp=1, cp=1, ep=1, edp_rank_shift=0, uninitialized=False):
+        self.world = tp * cp * dp
+        self.dp, self.dp_rank = dp * cp, s // tp
+        self.edp, self.edp_rank = self.world // ep, (s // ep + edp_rank_shift) % (self.world // ep)
+        if uninitialized:  # what Megatron returns before initialize_model_parallel
+            self.dp = self.dp_rank = self.edp = self.edp_rank = 0
+
+    def get_data_parallel_world_size(self, with_context_parallel=True, with_gtp_remat=True):
+        assert with_context_parallel and not with_gtp_remat, "copies count the replicate DP×CP group"
+        return self.dp
+
+    def get_data_parallel_rank(self, with_context_parallel=True, with_gtp_remat=True):
+        assert with_context_parallel and not with_gtp_remat, "copies count the replicate DP×CP group"
+        return self.dp_rank
+
+    def get_expert_data_parallel_world_size(self, with_gtp_remat=True):
+        assert not with_gtp_remat, "copies count the replicate expert DP"
+        return self.edp
+
+    def get_expert_data_parallel_rank(self, with_gtp_remat=True):
+        assert not with_gtp_remat, "copies count the replicate expert DP"
+        return self.edp_rank
+
+
+class TestMegatronTrainerCopy:
+    """``MegatronStackedWeightSource.trainer_copy()``: the disjoint full model copies
+    of a Megatron layout, read off a mocked ``parallel_state``."""
+
+    @staticmethod
+    def _copy(monkeypatch, groups):
+        import sys
+        import types
+
+        from skyrl.backends.skyrl_train.weight_sync.sharded_rdt.rdt_send import (
+            MegatronStackedWeightSource,
+        )
+
+        core = types.ModuleType("megatron.core")
+        core.parallel_state = groups  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "megatron.core", core)
+        return MegatronStackedWeightSource.__new__(MegatronStackedWeightSource).trainer_copy()
+
+    @pytest.mark.parametrize(
+        "dp,tp,cp,ep,num_copies",
+        [
+            # GLM-5.3 1024: TP1/CP16/EP16 at DP6. EDP = 96/16 = 6 < DP×CP = 96.
+            (6, 1, 16, 16, 6),
+            # DP16/EP8/TP1: EDP = 16/8 = 2 < DP×CP = 16, so a copy spans 8 DP ranks.
+            (16, 1, 1, 8, 2),
+            # Dense DP4/TP2/CP2: EDP = 16 > DP×CP = 8, so every TP group is a copy.
+            (4, 2, 2, 1, 8),
+        ],
+    )
+    def test_copies(self, monkeypatch, dp, tp, cp, ep, num_copies):
+        from skyrl.backends.skyrl_train.weight_sync.sharded_rdt.sharded_rdt_common import (
+            TrainerCopy,
+        )
+
+        world = tp * cp * dp
+        got = [self._copy(monkeypatch, _MegatronGroups(s, dp=dp, tp=tp, cp=cp, ep=ep)) for s in range(world)]
+        assert got == [TrainerCopy(s * num_copies // world, num_copies) for s in range(world)]
+        # Each copy holds every TP shard and every expert shard (CP ranks hold the same weights).
+        for k in range(num_copies):
+            ranks = [s for s in range(world) if got[s].copy_rank == k]
+            assert {s % tp for s in ranks} == set(range(tp))
+            assert {s % ep for s in ranks} == set(range(ep))
+
+    def test_equal_counts_with_disagreeing_ranks_raise(self, monkeypatch):
+        groups = _MegatronGroups(0, dp=6, edp_rank_shift=1)  # DP×CP = EDP = 6
+        with pytest.raises(RuntimeError, match="both have 6 copies, but this rank is DP rank 0 and expert-DP rank 1"):
+            self._copy(monkeypatch, groups)
+
+    def test_uninitialized_parallel_state_raises(self, monkeypatch):
+        with pytest.raises(RuntimeError, match=r"not initialized \(dp=0, expert dp=0\)"):
+            self._copy(monkeypatch, _MegatronGroups(0, dp=4, uninitialized=True))
+
+
 class TestStampedYieldValidation:
     """The gather loop checks stamps against yields per group — the ABC's
     truthfulness invariant, enforced where both sit side by side. Without it a

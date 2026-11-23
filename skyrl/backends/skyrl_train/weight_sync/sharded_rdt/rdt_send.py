@@ -27,6 +27,10 @@ from skyrl.backends.skyrl_train.weight_sync.sharded_rdt.sharded_rdt_base import 
     ParamMeta,
     layerwise_groups,
     materialize_full_tensor,
+    whole_model_copy,
+)
+from skyrl.backends.skyrl_train.weight_sync.sharded_rdt.sharded_rdt_common import (
+    TrainerCopy,
 )
 from skyrl.backends.skyrl_train.weight_sync.sources import (
     FsdpWeightSource,
@@ -204,6 +208,10 @@ class RdtFsdpWeightSource(FsdpWeightSource, GroupedWeightSource):
                 param = param.to(device, non_blocking=True)
             yield name, materialize_full_tensor(param).to(self._dtype).detach().contiguous()
 
+    def trainer_copy(self) -> TrainerCopy:
+        """Every rank gathers every name (``full_tensor()``), so each is a full copy."""
+        return whole_model_copy()
+
 
 class RdtMegatronWeightSource(MegatronWeightSource, GroupedWeightSource):
     """The shared Megatron ``WeightSource``, with RDT's group channels.
@@ -212,12 +220,16 @@ class RdtMegatronWeightSource(MegatronWeightSource, GroupedWeightSource):
     whole-model export, in HF-canonical (already group-contiguous) order, with
     every rank getting full tensors. For a pull backend that whole-model
     residency is the point -- each producer must be able to serve its bound
-    consumer the complete model -- so the inherited "hold everything" defaults
-    are correct and this subclass adds nothing else.
+    consumer the complete model -- so the inherited "hold everything" default
+    is correct and each rank is its own copy.
 
     :class:`MegatronStackedWeightSource` is the narrower alternative;
     ``make_megatron_weight_source`` falls back here when it cannot serve a layout.
     """
+
+    def trainer_copy(self) -> TrainerCopy:
+        """Every rank exports the whole model, so each is a full copy."""
+        return whole_model_copy()
 
 
 @dataclass(frozen=True)
@@ -389,7 +401,7 @@ class MegatronStackedWeightSource(GroupedWeightSource):
             from megatron.core import parallel_state
 
             pp_group = parallel_state.get_pipeline_model_parallel_group()
-        except Exception:  # noqa: BLE001 - no mpu (CPU tests, decentralized PGs)
+        except (ImportError, AssertionError):  # no megatron, or mpu not initialized (CPU tests, decentralized PGs)
             return 1, 0
         return torch.distributed.get_world_size(pp_group), torch.distributed.get_rank(pp_group)
 
@@ -400,7 +412,7 @@ class MegatronStackedWeightSource(GroupedWeightSource):
             from megatron.core import parallel_state
 
             ep_group = parallel_state.get_expert_model_parallel_group()
-        except Exception:  # noqa: BLE001 - no mpu (CPU tests, decentralized PGs)
+        except (ImportError, AssertionError):  # no megatron, or mpu not initialized (CPU tests, decentralized PGs)
             return 1, 0
         return torch.distributed.get_world_size(ep_group), torch.distributed.get_rank(ep_group)
 
@@ -412,8 +424,44 @@ class MegatronStackedWeightSource(GroupedWeightSource):
             from megatron.core import parallel_state
 
             return torch.distributed.get_world_size(parallel_state.get_expert_tensor_parallel_group())
-        except Exception:  # noqa: BLE001 - no mpu (CPU tests, decentralized PGs)
+        except (ImportError, AssertionError):  # no megatron, or mpu not initialized (CPU tests, decentralized PGs)
             return 1
+
+    def trainer_copy(self) -> TrainerCopy:
+        """This rank's place among the disjoint full model copies, read off
+        Megatron's data-parallel groups.
+
+        Dense names repeat over the DP×CP group (CP shards activations, not
+        weights), routed experts over the expert-DP group, both replicate
+        degrees (GTP-remat peers hold shards). A full copy needs both, so
+        ``num_copies`` is the smaller group's size and ``copy_rank`` is this
+        rank's place in it. Megatron lays both groups out with their
+        model-parallel axes innermost, so the ranks of one copy are a contiguous
+        run spanning every shard of each. Equal counts mean identical copies,
+        whose ranks must agree.
+
+        Raises:
+            RuntimeError: Megatron's parallel state is not initialized, or the
+                two groups agree on the count but not on this rank's copy.
+        """
+        from megatron.core import parallel_state
+
+        dp = parallel_state.get_data_parallel_world_size(with_context_parallel=True, with_gtp_remat=False)
+        dp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True, with_gtp_remat=False)
+        edp = parallel_state.get_expert_data_parallel_world_size(with_gtp_remat=False)
+        edp_rank = parallel_state.get_expert_data_parallel_rank(with_gtp_remat=False)
+        if dp < 1 or edp < 1:
+            raise RuntimeError(
+                f"[stacked-source] Megatron data-parallel groups are not initialized (dp={dp}, expert dp={edp})"
+            )
+        if edp < dp:
+            return TrainerCopy(edp_rank, edp)
+        if dp == edp and dp_rank != edp_rank:
+            raise RuntimeError(
+                f"[stacked-source] DP and expert-DP both have {dp} copies, but this rank is "
+                f"DP rank {dp_rank} and expert-DP rank {edp_rank}"
+            )
+        return TrainerCopy(dp_rank, dp)
 
     def _expert_geometry(self, layers: dict) -> dict:
         """Per-layer expert geometry for the layers THIS rank holds, read off

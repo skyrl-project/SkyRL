@@ -26,6 +26,9 @@ from skyrl.backends.skyrl_train.weight_sync.sharded_rdt.sharded_rdt_base import 
     ParamMeta,
     layerwise_groups,
 )
+from skyrl.backends.skyrl_train.weight_sync.sharded_rdt.sharded_rdt_common import (  # noqa: E402
+    TrainerCopy,
+)
 
 
 class TestGroupedWeightSourceContract:
@@ -52,6 +55,9 @@ class TestGroupedWeightSourceContract:
 
         def held_names(self):
             return self._held
+
+        def trainer_copy(self):
+            return TrainerCopy(0, 1)
 
         def iter_full(self):
             pairs = self._pairs
@@ -283,6 +289,13 @@ class TestRdtMegatronWeightSource:
         """Whole-model residency is the point for a pull backend: each producer
         must be able to serve its bound consumer the complete model."""
         assert self._source(["model.layers.0.a"]).held_names() is None
+
+    def test_every_rank_is_its_own_copy(self, monkeypatch):
+        """Each rank exports the whole model, so it is a full copy by itself."""
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 3)
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 8)
+        assert self._source(["model.layers.0.a"]).trainer_copy() == TrainerCopy(3, 8)
 
 
 class TestExpertNameResolution:
