@@ -455,9 +455,9 @@ Three source flavors, chosen by `make_megatron_weight_source` / `make_fsdp_weigh
   order (any permutation transfers identically as long as the two channels agree), which
   is why only RDT pays for the reorder.
 - `MegatronStackedWeightSource` — PP-local and EP-local, gathering experts at stack
-  granularity. `_pp_local_export_ctx` patches the bridge's PP broadcast so the owning
-  stage gets its tensor and every other stage gets `None` (which `megatron_to_hf` already
-  skips). Without it every rank materializes the whole model under PP; this is the actual
+  granularity. The walk runs inside megatron-bridge's
+  `MegatronParamMapping.skip_pp_broadcast()`, so the owning stage gets its tensor and
+  every other stage gets `None` (which `megatron_to_hf` skips). Without it every rank materializes the whole model under PP; this is the actual
   OOM fix, measured on Qwen3-32B at tp4/pp2 (70.56 GiB) and tp8/pp2 (73.06 GiB) of 79.18.
 - `RdtMegatronWeightSource` — the whole-model fallback, taken on four conditions
   (`_demoted`: a gather group spans PP stages, i.e. tied embeddings or MTP; grouped-export
