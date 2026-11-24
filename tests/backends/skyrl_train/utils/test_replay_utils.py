@@ -19,6 +19,37 @@ def _pack_routes(routes: torch.Tensor, attention_mask: torch.Tensor) -> PackedTe
     return PackedTensor.from_segments([routes[row][attention_mask[row].bool()] for row in range(routes.shape[0])])
 
 
+class _Replay:
+    """A megatron-core ``RouterReplay`` instance, as replay setup uses it."""
+
+    def __init__(self, is_mtp_layer=False):
+        self.is_mtp_layer = is_mtp_layer
+        self.target_topk_idx = self.router_replay_action = None
+
+    def set_target_indices(self, indices):
+        self.target_topk_idx = indices
+
+
+def _install_router_replay(monkeypatch, instances):
+    """Stub megatron-core's ``RouterReplay`` registry over ``instances``; returns ``RouterReplayAction``."""
+
+    class RouterReplay:
+        @staticmethod
+        def get_instances(is_mtp_layer=None):
+            return [r for r in instances if is_mtp_layer is None or r.is_mtp_layer == is_mtp_layer]
+
+        @staticmethod
+        def set_global_router_replay_action(action, *, is_mtp_layer=None):
+            for router in RouterReplay.get_instances(is_mtp_layer):
+                router.router_replay_action = action
+
+    module = types.ModuleType("megatron.core.transformer.moe.router_replay")
+    module.RouterReplay = RouterReplay
+    module.RouterReplayAction = SimpleNamespace(REPLAY_FORWARD="replay_forward", REPLAY_BACKWARD="replay_backward")
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    return module.RouterReplayAction
+
+
 @pytest.fixture
 def parallel_state(monkeypatch):
     try:
@@ -72,27 +103,8 @@ def test_replay_has_no_dispatcher_specific_patch():
 
 @pytest.mark.parametrize("route_dtype", [torch.uint8, torch.int16, torch.int32])
 def test_setup_replay_installs_indices_and_returns_model_mask(monkeypatch, parallel_state, route_dtype):
-    router_replay_module = types.ModuleType("megatron.core.transformer.moe.router_replay")
-
-    class RouterReplay:
-        global_router_replay_instances = [object()]
-        replay_data = None
-        action = None
-
-        @classmethod
-        def set_replay_data(cls, replay_data):
-            cls.replay_data = replay_data
-
-        @classmethod
-        def set_global_router_replay_action(cls, action):
-            cls.action = action
-
-    class RouterReplayAction:
-        REPLAY_FORWARD = "replay_forward"
-
-    router_replay_module.RouterReplay = RouterReplay
-    router_replay_module.RouterReplayAction = RouterReplayAction
-    monkeypatch.setitem(sys.modules, "megatron.core.transformer.moe.router_replay", router_replay_module)
+    router = _Replay()
+    RouterReplayAction = _install_router_replay(monkeypatch, [router])
     monkeypatch.setattr(replay_utils, "_get_current_pp_stage_layer_range", lambda model_config: (1, 1))
     monkeypatch.setattr(
         replay_utils,
@@ -137,9 +149,9 @@ def test_setup_replay_installs_indices_and_returns_model_mask(monkeypatch, paral
         metadata_layout=metadata_layout,
     )
 
-    assert RouterReplay.replay_data[0].tolist() == [[1, 2], [3, 4], [5, 6]]
-    assert RouterReplay.replay_data[0].dtype == torch.int32
-    assert RouterReplay.action == RouterReplayAction.REPLAY_FORWARD
+    assert router.target_topk_idx.tolist() == [[1, 2], [3, 4], [5, 6]]
+    assert router.target_topk_idx.dtype == torch.int32
+    assert router.router_replay_action == RouterReplayAction.REPLAY_FORWARD
     assert model_kwargs["padding_mask"].tolist() == [[False, False, True]]
     assert routed_layer_counts == [1]
 
@@ -148,23 +160,8 @@ def test_setup_replay_installs_indices_and_returns_model_mask(monkeypatch, paral
 @pytest.mark.parametrize("tp_size", [1, 2])
 def test_replay_indices_are_dtype_independent(monkeypatch, parallel_state, packed, tp_size):
     """Compact host routes must produce the same int32 replay data as int32 routes."""
-    router_replay_module = types.ModuleType("megatron.core.transformer.moe.router_replay")
-
-    class RouterReplay:
-        global_router_replay_instances = [object(), object()]
-        replay_data = None
-
-        @classmethod
-        def set_replay_data(cls, replay_data):
-            cls.replay_data = replay_data
-
-        @classmethod
-        def set_global_router_replay_action(cls, action):
-            pass
-
-    router_replay_module.RouterReplay = RouterReplay
-    router_replay_module.RouterReplayAction = SimpleNamespace(REPLAY_FORWARD="replay_forward")
-    monkeypatch.setitem(sys.modules, "megatron.core.transformer.moe.router_replay", router_replay_module)
+    routers = [_Replay(), _Replay()]
+    _install_router_replay(monkeypatch, routers)
     monkeypatch.setattr(replay_utils, "_get_current_pp_stage_layer_range", lambda model_config: (1, 2))
     monkeypatch.setattr(
         replay_utils,
@@ -200,7 +197,7 @@ def test_replay_indices_are_dtype_independent(monkeypatch, parallel_state, packe
             metadata_layout=layout,
             remove_microbatch_padding=packed,
         )
-        return [tensor.clone() for tensor in RouterReplay.replay_data]
+        return [router.target_topk_idx.clone() for router in routers]
 
     from_int16 = run(routes_int16)
     from_int32 = run(routes_int32)
