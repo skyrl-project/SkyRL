@@ -44,6 +44,12 @@ INFERENCE_ENGINE_EXPERT_PARALLEL_SIZE="${INFERENCE_ENGINE_EXPERT_PARALLEL_SIZE:-
 INFERENCE_ENGINE_GPU_MEMORY_UTILIZATION="${INFERENCE_ENGINE_GPU_MEMORY_UTILIZATION:-0.8}"
 # sharded_rdt is the backend PR 2762 adds the drafter sync to. nccl is the fallback.
 WEIGHT_SYNC_BACKEND="${WEIGHT_SYNC_BACKEND:-sharded_rdt}"
+# sharded_rdt needs vLLM's Ray executor (the engine refuses mp at init); nccl runs on mp.
+if [ "$WEIGHT_SYNC_BACKEND" = "sharded_rdt" ]; then
+  INFERENCE_EXECUTOR_BACKEND="${INFERENCE_EXECUTOR_BACKEND:-ray}"
+else
+  INFERENCE_EXECUTOR_BACKEND="${INFERENCE_EXECUTOR_BACKEND:-mp}"
+fi
 
 # ---- batch: 16 prompts x 16 samples = 256 sequences per step, 128 per engine ----
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-16}"
@@ -218,7 +224,7 @@ ${UV_RUN:-uv run --isolated} --extra megatron -m examples.train.algorithms.dapo.
   generator.inference_engine.backend=vllm \
   generator.inference_engine.run_engines_locally=true \
   generator.inference_engine.weight_sync_backend=$WEIGHT_SYNC_BACKEND \
-  generator.inference_engine.distributed_executor_backend=mp \
+  generator.inference_engine.distributed_executor_backend="$INFERENCE_EXECUTOR_BACKEND" \
   generator.inference_engine.num_engines=$NUM_INFERENCE_ENGINES \
   generator.inference_engine.tensor_parallel_size=$INFERENCE_ENGINE_TENSOR_PARALLEL_SIZE \
   generator.inference_engine.data_parallel_size=$INFERENCE_ENGINE_DATA_PARALLEL_SIZE \
