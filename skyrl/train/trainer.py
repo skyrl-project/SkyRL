@@ -1550,12 +1550,13 @@ class RayPPOTrainer:
         rewards = rewards - kl * max(0, kl_loss_coef)
         data["rewards"] = rewards
 
-        avg_kl: float = kl_mean.mean().item()
-        avg_kl_max: float = kl_max.mean().item()
+        num_samples = data.batch_size - data.metadata.get("pad_size", 0)
+        avg_kl = kl_mean[:num_samples].mean().item()
+        avg_kl_max = kl_max[:num_samples].mean().item()
 
         # update the kl controller
         if self.reward_kl_controller is not None:
-            self.reward_kl_controller.update(current=avg_kl, n_steps=kl.shape[0])  # n_steps is just the batch size
+            self.reward_kl_controller.update(current=avg_kl, n_steps=num_samples)
         if "metrics" not in data.metadata:
             data.metadata["metrics"] = {}
 
