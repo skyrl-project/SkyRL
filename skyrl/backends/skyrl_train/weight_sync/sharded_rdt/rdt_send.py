@@ -120,61 +120,6 @@ def _qkv_index_device_ctx():
             setattr(mod, name, fn)
 
 
-@contextlib.contextmanager
-def _pp_local_export_ctx():
-    """Export each stage's own parameters, with no cross-stage communication.
-
-    ``megatron_to_hf`` normally starts by broadcasting the parameter from the
-    pipeline stage that holds it to every other stage, so every rank ends up with
-    every tensor. A stage that exports only its OWN tasks would then mismatch its
-    peers' collectives and hang. Inside this context the two PP primitives return
-    the local value instead: the owning stage gets its own tensor, every other
-    stage gets ``None``, which every ``megatron_to_hf`` already treats as "not
-    mine" and skips. TP and EP gathers are untouched — they run within a stage.
-
-    Patched on the CLASS rather than on the tasks' mapping instances, for two
-    reasons. Nothing in megatron-bridge overrides these two methods (they are
-    defined once on ``MegatronParamMapping``), so one wrap covers every mapping
-    including the ``_HFNameSuffixMapping`` wrapper, which reaches them through
-    ``__getattr__``. And ``AutoMapping`` builds its delegate lazily INSIDE
-    ``megatron_to_hf``, so an instance-level change — clearing ``pp_group`` to
-    reach the upstream ``pp_size == 1`` fast path, say — would miss the delegate
-    that actually performs the broadcast.
-
-    megatron-bridge 0.8 added the same mode upstream, ``skip_pp_broadcast()``, and
-    ``AutoMapping`` takes its "not mine" exit only inside it: a task with no local
-    module otherwise resolves its parallelism type to ``None`` and raises. The bridge
-    clears the module of the MTP stage's copy of the input embedding so that it is
-    exported once, from the first stage, so without the upstream mode only the MTP
-    stage fails its walk. ``make_megatron_weight_source`` then falls back on that
-    stage alone, and the stages meet in different PP collectives. So enter the
-    upstream mode too.
-    """
-    from megatron.bridge.models.conversion.param_mapping import MegatronParamMapping
-
-    saved = (
-        MegatronParamMapping.broadcast_from_pp_rank,
-        MegatronParamMapping.broadcast_obj_from_pp_rank,
-    )
-
-    def _local_tensor(self, tensor, cache_key=None):
-        return tensor
-
-    def _local_obj(self, obj, cache_key=None):
-        return obj
-
-    MegatronParamMapping.broadcast_from_pp_rank = _local_tensor
-    MegatronParamMapping.broadcast_obj_from_pp_rank = _local_obj
-    try:
-        with MegatronParamMapping.skip_pp_broadcast():
-            yield
-    finally:
-        (
-            MegatronParamMapping.broadcast_from_pp_rank,
-            MegatronParamMapping.broadcast_obj_from_pp_rank,
-        ) = saved
-
-
 class RdtFsdpWeightSource(FsdpWeightSource, GroupedWeightSource):
     """The shared FSDP ``WeightSource``, re-ordered group-major.
 
@@ -794,7 +739,7 @@ class MegatronStackedWeightSource(GroupedWeightSource):
 
         PP-local mode narrows the walk to this stage: only locally-held
         conversion tasks are exported, and the export is CONSUMED inside
-        ``_pp_local_export_ctx()`` (the bridge returns a generator, so its
+        megatron-bridge's ``MegatronParamMapping.skip_pp_broadcast()`` (the bridge returns a generator, so its
         collectives run while we iterate — entering the context only around the
         call that builds it would do nothing). ``layers`` is already local-only,
         since ``_expert_geometry`` skips the cross-stage exchange in this mode."""
@@ -807,7 +752,13 @@ class MegatronStackedWeightSource(GroupedWeightSource):
         target_dev = torch.device("cuda", device) if device is not None else None
         _ctx = contextlib.ExitStack()
         if self._pp_local:
-            _ctx.enter_context(_pp_local_export_ctx())
+            from megatron.bridge.models.conversion.param_mapping import (
+                MegatronParamMapping,
+            )
+
+            # The bridge's PP broadcasts return the local value, and a task without a local module
+            # (such as the MTP stage's copy of the input embedding) is skipped instead of raising.
+            _ctx.enter_context(MegatronParamMapping.skip_pp_broadcast())
         # Independent of PP-local (see _qkv_index_device_ctx).
         _ctx.enter_context(_qkv_index_device_ctx())
         # Not export_hf_weights: with precomputed conversion_tasks it hands the

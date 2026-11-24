@@ -13,6 +13,7 @@ Marked `vllm`: `sharded_rdt_base` imports the base ABCs from the wheel.
 """
 
 import importlib
+import sys
 from functools import cached_property
 from types import SimpleNamespace
 
@@ -615,7 +616,9 @@ class TestMtpExperts:
         groups.append(["model.norm.weight", "lm_head.weight", *tail])
         src._group_index_of_name = {n: gi for gi, g in enumerate(groups) for n in g}
         src._owned_group_idx = list(range(len(groups)))
-        monkeypatch.setattr(rdt_send, "_pp_local_export_ctx", contextlib.nullcontext)
+        # The walk enters megatron-bridge's skip_pp_broadcast(); this test runs without the bridge installed.
+        bridge_mapping = SimpleNamespace(MegatronParamMapping=SimpleNamespace(skip_pp_broadcast=contextlib.nullcontext))
+        monkeypatch.setitem(sys.modules, "megatron.bridge.models.conversion.param_mapping", bridge_mapping)
         monkeypatch.setattr(rdt_send, "_qkv_index_device_ctx", contextlib.nullcontext)
         return [
             (

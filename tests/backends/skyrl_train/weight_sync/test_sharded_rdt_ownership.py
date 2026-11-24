@@ -586,19 +586,19 @@ class TestQkvIndexDeviceCtx:
 
 
 @pytest.mark.megatron
-class TestPpLocalExportCtx:
-    """``_pp_local_export_ctx`` makes each stage export only its own tasks, with no
-    PP broadcast. A task the stage has no module for must be skipped there, not
-    fail: megatron-bridge clears the module of the MTP stage's copy of the input
-    embedding so that it is exported once, from the first stage. If that task
-    raises, only the MTP stage falls back to the plain source, and the stages then
-    meet in different PP collectives and unpickle each other's payloads."""
+class TestSkipPpBroadcast:
+    """megatron-bridge's ``MegatronParamMapping.skip_pp_broadcast()`` makes each stage export only its own tasks, with
+    no PP broadcast. A task the stage has no module for must be skipped there, not fail: megatron-bridge clears
+    the module of the MTP stage's copy of the input embedding so that it is exported once, from the first stage.
+    If that task raises, only the MTP stage falls back to the plain source, and the stages then meet in
+    different PP collectives and unpickle each other's payloads."""
 
     def test_a_task_without_a_local_module_is_skipped(self):
-        from megatron.bridge.models.conversion.param_mapping import AutoMapping
-
-        from skyrl.backends.skyrl_train.weight_sync.sharded_rdt import rdt_send
+        from megatron.bridge.models.conversion.param_mapping import (
+            AutoMapping,
+            MegatronParamMapping,
+        )
 
         mapping = AutoMapping(megatron_param="embedding.word_embeddings.weight", hf_param="model.embed_tokens.weight")
-        with rdt_send._pp_local_export_ctx():
+        with MegatronParamMapping.skip_pp_broadcast():
             assert mapping.megatron_to_hf(None, None) == {}
