@@ -16,7 +16,8 @@ set -x
 #   capture sizes up to max_num_seqs * (k+1)   | NVFP4 KV cache         -> bf16 KV cache
 #   sharded_rdt weight sync, top-k 128 / top-p 0.99
 #
-# STATUS: NOT RUN. The config passes validate_cfg; no GPU run exists yet. Known risks are in the PR text.
+# STATUS: the MTP arm ran 6 steps on 8x8 B200 with WEIGHT_SYNC_BACKEND=nccl. The default sharded_rdt segfaults
+# at the first sync on Ray 2.57.0 (set-before-register race, fixed in Ray 2.58.0 by ray-project/ray#64558).
 #
 #   bash examples/train/algorithms/dapo/prepare_dapo_data.sh
 #   bash examples/train/spec_decode/run_megatron_dapo_glm5.3_specdecode_port.sh                    # MTP
@@ -98,8 +99,13 @@ MEGATRON_ETP=1
 # computes its own DSA top-k. 26 / 28 / 24 layers is the split PR 2808 uses: 3 dense layers ("D-"), then
 # attention + MoE layers ("DE").
 HYBRID_LAYER_PATTERN="${HYBRID_LAYER_PATTERN:-D-D-D-$(printf 'DE%.0s' {1..23})|$(printf 'DE%.0s' {1..28})|$(printf 'DE%.0s' {1..24})}"
-# [moe] is what ran on B200 with the MTP stack; [core_attn,moe] is the 8-node recipe's default.
-RECOMPUTE_MODULES="${RECOMPUTE_MODULES:-[moe]}"
+# Full activation recompute, one layer at a time (as in PR 2808). With selective [moe] recompute this layout
+# reached the 178 GiB limit on 4 of 6 trainer nodes in step 1 and NCCL ran out of memory; full recompute peaks
+# at 148-170 GiB and costs ~78% more policy_train time.
+RECOMPUTE_GRANULARITY="${RECOMPUTE_GRANULARITY:-full}"
+RECOMPUTE_METHOD="${RECOMPUTE_METHOD:-uniform}"
+RECOMPUTE_NUM_LAYERS="${RECOMPUTE_NUM_LAYERS:-1}"
+RECOMPUTE_MODULES="${RECOMPUTE_MODULES:-null}"
 # Sparse attention on cuDNN/FlashMLA, the indexer top-k on TileLang (patch_dsa_hybrid_indexer).
 DSA_KERNEL_BACKEND=cudnn
 export SKYRL_DSA_INDEXER_BACKEND=tilelang
@@ -186,10 +192,10 @@ ${UV_RUN:-uv run --isolated} --extra megatron -m examples.train.algorithms.dapo.
   trainer.policy.megatron_config.ddp_config.grad_reduce_in_fp32=true \
   trainer.policy.megatron_config.transformer_config_kwargs.hybrid_layer_pattern="'$HYBRID_LAYER_PATTERN'" \
   trainer.policy.megatron_config.transformer_config_kwargs.sequence_parallel=true \
-  trainer.policy.megatron_config.transformer_config_kwargs.recompute_granularity="selective" \
+  trainer.policy.megatron_config.transformer_config_kwargs.recompute_granularity=$RECOMPUTE_GRANULARITY \
   trainer.policy.megatron_config.transformer_config_kwargs.recompute_modules=$RECOMPUTE_MODULES \
-  trainer.policy.megatron_config.transformer_config_kwargs.recompute_method=null \
-  trainer.policy.megatron_config.transformer_config_kwargs.recompute_num_layers=null \
+  trainer.policy.megatron_config.transformer_config_kwargs.recompute_method=$RECOMPUTE_METHOD \
+  trainer.policy.megatron_config.transformer_config_kwargs.recompute_num_layers=$RECOMPUTE_NUM_LAYERS \
   trainer.policy.megatron_config.transformer_config_kwargs.mlp_chunks_for_training=1 \
   trainer.policy.megatron_config.transformer_config_kwargs.gradient_accumulation_fusion=false \
   trainer.policy.megatron_config.transformer_config_kwargs.dsa_indexer_loss_coeff=0.0 \
