@@ -72,26 +72,29 @@ def mtp_lr_config_overrides(config: OptimizerConfig, mtp_lr: float) -> dict:
 
     The heads' group runs the policy's schedule between ``mtp_lr`` and a ``min_lr`` at the policy's
     ``min_lr / lr`` ratio. Matched by name (``is_mtp_param_name``), like the heads' separate grad clip.
+    The ``skyrl_mtp_heads`` key tags the heads' groups for ``mtp_heads_lr``: Megatron copies an override's
+    keys into the param group, and the ``max_lr`` alone can match other groups (the policy's lr, ``decoupled_lr``).
     """
     overrides = get_standard_config_overrides(config)
     heads = ParamKey(
         with_name_predicate=ParamWithNamePredicate(name="mtp_heads", fn=lambda param, name: is_mtp_param_name(name))
     )
     min_lr = mtp_lr * config.min_lr / config.lr if config.lr else 0.0
-    overrides[heads] = ParamGroupOverride(max_lr=mtp_lr, min_lr=min_lr)
+    overrides[heads] = ParamGroupOverride(max_lr=mtp_lr, min_lr=min_lr, skyrl_mtp_heads=True)
     return overrides
 
 
 def mtp_heads_lr(optimizer, mtp_lr: Optional[float]) -> float:
-    """The MTP heads' current learning rate: their own groups' (found by the ``max_lr`` their override sets) when
-    ``mtp_lr`` is set, else the policy's ``param_groups[0]``, which then holds them. Megatron aligns the param groups
-    across ranks, so a rank without heads (a PP stage without the MTP layer) still has their groups, empty and
-    scheduled. The heads can span several groups (weight decay, expert parallel), all on one schedule."""
+    """The MTP heads' current learning rate: their own groups' (found by the ``skyrl_mtp_heads`` tag their override
+    sets) when ``mtp_lr`` is set, else the policy's ``param_groups[0]``, which then holds them. Megatron aligns the
+    param groups across ranks, so a rank without heads (a PP stage without the MTP layer) still has their groups,
+    empty, tagged and scheduled. The heads can span several groups (weight decay, expert parallel), all on one
+    schedule."""
     groups = optimizer.param_groups
     if mtp_lr is None:
         return groups[0]["lr"]
-    heads = [g["lr"] for g in groups if g.get("max_lr") == mtp_lr]
-    assert heads, f"no optimizer param group has the MTP heads' max_lr {mtp_lr}"
+    heads = [g["lr"] for g in groups if g.get("skyrl_mtp_heads")]
+    assert heads, f"no optimizer param group has the MTP heads' skyrl_mtp_heads tag (trainer.mtp.lr={mtp_lr})"
     return heads[0]
 
 
