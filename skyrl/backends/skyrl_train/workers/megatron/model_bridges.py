@@ -8,6 +8,8 @@ All registrations are guarded by a top-level ``try/except ImportError`` so that
 the rest of the codebase still works in CPU-only (no megatron-bridge) environments.
 """
 
+from loguru import logger
+
 try:
     from megatron.bridge.models.conversion.mapping_registry import (
         MegatronMappingRegistry,
@@ -246,3 +248,178 @@ except ImportError:
     def maybe_force_qwen35_text_bridge(bridge, hf_config) -> bool:  # noqa: D103
         # megatron-bridge not installed (e.g. CPU-only environment): nothing to force.
         return False
+
+
+# Per rope_type, each rope_parameters key Megatron-Bridge translates -> the provider field it sets (model_bridge.py:
+# 652-659, 782-783; llama_bridge.py:83-100). None: no provider field; Megatron Core fixes the value (_LLAMA3_FIXED).
+# rope_theta -> rotary_base holds for every type; any other key would reach vLLM but not the Megatron model.
+_ROPE_FIELDS = {
+    "default": {},
+    "yarn": {
+        "factor": "yarn_rotary_scaling_factor",
+        "original_max_position_embeddings": "yarn_original_max_position_embeddings",
+        "beta_fast": "yarn_beta_fast",
+        "beta_slow": "yarn_beta_slow",
+        "mscale": "yarn_mscale",
+        "mscale_all_dim": "yarn_mscale_all_dim",
+        "truncate": "yarn_correction_range_round_to_int",
+    },
+    "linear": {"factor": "seq_len_interpolation_factor"},
+    "llama3": {
+        "factor": "rope_scaling_factor",
+        "low_freq_factor": None,
+        "high_freq_factor": None,
+        "original_max_position_embeddings": None,
+    },
+}
+# MLA providers take YaRN under their own field names, and Bridge has no "truncate" for them (model_bridge.py:672-679).
+_MLA_YARN_FIELDS = {
+    "factor": "rotary_scaling_factor",
+    "original_max_position_embeddings": "original_max_position_embeddings",
+    "beta_fast": "beta_fast",
+    "beta_slow": "beta_slow",
+    "mscale": "mscale",
+    "mscale_all_dim": "mscale_all_dim",
+}
+# Keys every rope_type takes, and the provider field Megatron-Bridge sets from each.
+_COMMON_ROPE_FIELDS = {"rope_theta": "rotary_base", "partial_rotary_factor": "rotary_percent"}
+# The mode a rope_type needs on GPT providers, without which Megatron Core ignores the fields above.
+_GPT_ROPE_MODES = {"yarn": {"position_embedding_type": "yarn"}, "llama3": {"rope_scaling": True}}
+# The llama3 values Megatron Core applies whatever the config says (rotary_pos_embedding.py's _apply_scaling defaults).
+_LLAMA3_FIXED = {"low_freq_factor": 1.0, "high_freq_factor": 4.0, "original_max_position_embeddings": 8192}
+# Keys an override must name, and why.
+_REQUIRED_ROPE_KEYS = {
+    "yarn": (
+        ("original_max_position_embeddings",),
+        "the context length the checkpoint was trained with; Megatron-Bridge has no default for it",
+    ),
+    "llama3": (
+        ("low_freq_factor", "high_freq_factor", "original_max_position_embeddings"),
+        "Megatron Core applies llama3 with 1.0, 4.0 and 8192, and transformers cannot save a llama3 config without "
+        "them, so the HF export would fail",
+    ),
+}
+# (Megatron-Bridge bridge, rope_type) pairs whose Megatron-vs-vLLM logprobs have been compared with the override
+# applied, in test_megatron_models.py::test_logprobs_matching_roundtrip_with_rope_override. The check below sees only
+# the provider fields, not what Megatron Core computes from them, so every other pair is applied with a warning.
+_VERIFIED_ROPE_OVERRIDES = {
+    ("Qwen2Bridge", "default"),  # [qwen2-theta]
+    ("Qwen2Bridge", "yarn"),  # [qwen2-yarn]
+    ("Qwen3Bridge", "default"),  # [qwen3-theta]
+    ("Qwen3Bridge", "yarn"),  # [qwen3-yarn]
+    ("Qwen3MoEBridge", "yarn"),  # [qwen3-moe-yarn]
+    ("DeepSeekV3Bridge", "yarn"),  # [moonlight-mla-yarn], MLA
+}
+
+
+def _rope_type(rope_parameters: dict) -> str:
+    return rope_parameters.get("rope_type") or rope_parameters.get("type") or "default"
+
+
+def apply_rope_override(hf_config, rope_parameters: dict) -> None:
+    """Write a RoPE override into an HF config.
+
+    This is the same write vLLM makes for ``hf_overrides.rope_parameters`` (top-level ``rope_parameters``). Applied
+    to ``bridge.hf_pretrained.config`` before ``bridge.to_megatron_provider()``, it reaches the Megatron model
+    (confirm with :func:`check_rope_override`); applied to the config saved on export, the exported checkpoint
+    carries it too.
+    """
+    hf_config.rope_parameters = dict(rope_parameters)
+    # Megatron-Bridge maps a top-level rope_theta before it reads rope_parameters, so set both.
+    if "rope_theta" in rope_parameters:
+        hf_config.rope_theta = rope_parameters["rope_theta"]
+
+
+def _expected_rope_fields(provider, rope_parameters: dict) -> dict:
+    """The provider fields, and values, that Megatron-Bridge sets for this override."""
+    rope_type = _rope_type(rope_parameters)
+    if rope_type not in _ROPE_FIELDS:
+        raise ValueError(
+            f"transformer_config_kwargs.rope_parameters.rope_type={rope_type!r} is not supported on the Megatron "
+            f"backend; supported: {', '.join(_ROPE_FIELDS)}."
+        )
+    if "rope_theta" not in rope_parameters:
+        raise ValueError(
+            "transformer_config_kwargs.rope_parameters needs 'rope_theta': it replaces the checkpoint's whole "
+            "rope_parameters, and without it Megatron-Bridge and vLLM fall back to different defaults."
+        )
+    mla = getattr(provider, "multi_latent_attention", False)
+    fields = {**_COMMON_ROPE_FIELDS, **(_MLA_YARN_FIELDS if rope_type == "yarn" and mla else _ROPE_FIELDS[rope_type])}
+    untranslated = sorted(set(rope_parameters) - {"rope_type", "type", *fields})
+    if untranslated:
+        raise ValueError(
+            f"transformer_config_kwargs.rope_parameters sets {untranslated}, which Megatron-Bridge does not translate "
+            f"for rope_type={rope_type!r}: vLLM would apply them and the Megatron model would not."
+        )
+    if rope_type != "default" and "factor" not in rope_parameters:
+        raise ValueError(f"transformer_config_kwargs.rope_parameters with rope_type={rope_type!r} needs a 'factor'.")
+    required, reason = _REQUIRED_ROPE_KEYS.get(rope_type, ((), ""))
+    missing = [key for key in required if key not in rope_parameters]
+    if missing:
+        raise ValueError(
+            f"transformer_config_kwargs.rope_parameters with rope_type={rope_type!r} needs "
+            f"{', '.join(repr(key) for key in missing)} ({reason})."
+        )
+    if rope_type == "llama3":
+        unfixed = {key: rope_parameters[key] for key, value in _LLAMA3_FIXED.items() if rope_parameters[key] != value}
+        if unfixed:
+            raise ValueError(
+                f"transformer_config_kwargs.rope_parameters with rope_type='llama3' sets {unfixed}, but Megatron Core "
+                f"applies llama3 with {_LLAMA3_FIXED} and only the factor is free, so the trainer and vLLM would use "
+                "different frequencies."
+            )
+    if mla and rope_parameters.get("partial_rotary_factor", 1.0) != 1.0:
+        raise ValueError(
+            f"transformer_config_kwargs.rope_parameters sets partial_rotary_factor="
+            f"{rope_parameters['partial_rotary_factor']} on a multi-latent-attention model: Megatron Core's MLA "
+            "rotates the whole RoPE head dimension, so the trainer and vLLM would use different positions."
+        )
+    rotary_percent = getattr(provider, "rotary_percent", 1.0)
+    if rope_type == "yarn" and not mla and rotary_percent != 1.0:
+        raise ValueError(
+            "transformer_config_kwargs.rope_parameters with rope_type='yarn' is not supported for this model on the "
+            f"Megatron backend: it rotates {rotary_percent:.0%} of each attention head (partial_rotary_factor), and "
+            "Megatron Core's YaRN embedding rotates the whole head, so the trainer and vLLM would use different "
+            "positions."
+        )
+    # Megatron Core takes YaRN's mscale / mscale_all_dim ratio unless either is None (yarn_rotary_pos_embedding.py:290),
+    # vLLM's GPT YaRN only when both are truthy (yarn.py:40), and Megatron-Bridge passes a 0 through.
+    if rope_type == "yarn" and not mla and {"mscale", "mscale_all_dim"} <= set(rope_parameters):
+        if not (rope_parameters["mscale"] and rope_parameters["mscale_all_dim"]):
+            raise ValueError(
+                f"transformer_config_kwargs.rope_parameters with rope_type='yarn' sets mscale="
+                f"{rope_parameters['mscale']} and mscale_all_dim={rope_parameters['mscale_all_dim']}: with either at 0, "
+                "Megatron Core and vLLM scale the attention differently for this model. Leave both out, or set both "
+                "to non-zero values."
+            )
+    expected = {field: rope_parameters[key] for key, field in fields.items() if field and key in rope_parameters}
+    if not mla:
+        expected.update(_GPT_ROPE_MODES.get(rope_type, {}))
+    return expected
+
+
+def check_rope_override(provider, rope_parameters: dict, bridge_name: str) -> None:
+    """Raise unless ``provider`` carries every field the RoPE override implies.
+
+    Megatron-Bridge drops RoPE settings it cannot translate for a model without an error (``linear`` outside the
+    Llama bridges, for example), which would leave the trainer on different positions than the inference engine.
+    """
+    expected = _expected_rope_fields(provider, rope_parameters)
+    actual = {field: getattr(provider, field, None) for field in expected}
+    if actual != expected:
+        raise ValueError(
+            f"transformer_config_kwargs.rope_parameters={dict(rope_parameters)} did not reach the Megatron model: "
+            f"{bridge_name} does not translate it (expected provider fields {expected}, got {actual}). Use a "
+            "rope_type and values this model's Megatron-Bridge bridge applies."
+        )
+    rope_type = _rope_type(rope_parameters)
+    if (bridge_name, rope_type) not in _VERIFIED_ROPE_OVERRIDES:
+        logger.warning(
+            f"transformer_config_kwargs.rope_parameters (rope_type={rope_type!r}) is applied to {bridge_name} on a "
+            "best-effort basis: Megatron-Bridge set the provider fields it implies, but Megatron's logprobs have not "
+            "been compared with vLLM's for this bridge and rope_type. You can check it in this run: "
+            "policy/minibatch_rollout_logprobs_abs_diff_mean compares vLLM's rollout logprobs with the trainer's, "
+            "and should stay where it is for this model without the override; a RoPE mismatch shows up as a jump "
+            "from the first step. Offline, run test_logprobs_matching_roundtrip(rope_parameters=...) in "
+            "tests/backends/skyrl_train/gpu/gpu_ci/megatron/test_megatron_models.py on this model."
+        )
