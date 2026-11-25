@@ -1204,6 +1204,8 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
         # DeepSeek-V4.1 switches read by the Megatron workers (patches/megatron/deepseek_v41: KV fake-quant,
         # Engram table placement, faulthandler).
         env_vars.update({k: v for k, v in os.environ.items() if k.startswith("SKYRL_DSV41_")})
+        # NCCL tuning set on the driver (e.g. NCCL_BUFFSIZE). NCCL_CUMEM_ENABLE is managed separately.
+        env_vars.update({k: v for k, v in os.environ.items() if k.startswith("NCCL_") and k != "NCCL_CUMEM_ENABLE"})
 
         # Expert NVFP4: FlashInfer's NVFP4 env for the engines' per-token activation quantization (the trainer sets
         # it around its own launches), every key explicit so stray shell values cannot change the grid.
