@@ -1360,15 +1360,17 @@ class FullyAsyncConfig(BaseConfig):
     ``max(num_parallel_generation_workers, policy_mini_batch_size * (max_staleness_steps + 1))`` groups
     are not yet trained on. When ``policy_mini_batch_size * (max_staleness_steps + 1)`` is at most
     ``num_parallel_generation_workers`` (always true for ``0``), a finished group holds its slot until
-    the step that trains on it. When it is larger, a finished group frees its slot at once. A cut can add
-    steps to the age of a group, so that trainer does not guarantee ``j - i <= max_staleness_steps``."""
+    the step that trains on it. When it is larger, a finished group frees its slot at once. That trainer
+    sets no limit on the number of policy versions that generate one trajectory, so it does not guarantee
+    ``j - i <= max_staleness_steps``."""
     num_parallel_generation_workers: int = 768
     """Number of generation workers to spawn. Should be >= ``policy_mini_batch_size`` and
     <= ``policy_mini_batch_size * (max_staleness_steps + 1)``.
 
     For the colocated partial-rollout trainer, this is the number of groups in flight. It must be
     >= ``policy_mini_batch_size``, and the upper bound does not apply: each step trains on the first
-    ``policy_mini_batch_size`` groups to finish and cuts the rest."""
+    ``policy_mini_batch_size`` groups to finish, and the rest stay paused through training and resume
+    under the next policy version."""
     sample_full_batch: bool = False
     """Requires ``zero_variance_filter=True``. Drop zero-variance groups and keep pulling until the
     mini-batch is full of non-zero-variance groups (async-native DAPO ``dynamic_sampling="filter"``).

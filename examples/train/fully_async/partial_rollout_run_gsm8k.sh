@@ -2,8 +2,8 @@
 # Same knobs as examples/train/fully_async/fully_async_run_gsm8k.sh except:
 # - colocate_all=true: all NUM_GPUS are shared between the inference engines and the trainer
 # - NUM_PARALLEL_GENERATION_WORKERS is the number of groups in flight; each step trains on the first
-#   MINI_BATCH_SIZE to finish and cuts the rest, so 1 - MINI_BATCH_SIZE/NUM_PARALLEL_GENERATION_WORKERS
-#   of the in-flight groups resume under the next policy.
+#   MINI_BATCH_SIZE to finish, and the rest stay paused through training, so about
+#   1 - MINI_BATCH_SIZE/NUM_PARALLEL_GENERATION_WORKERS of the in-flight groups resume under the next policy.
 # uv run examples/train/gsm8k/gsm8k_dataset.py --output_dir $HOME/data/gsm8k
 # export WANDB_API_KEY=<your_key_here>
 # bash examples/train/fully_async/partial_rollout_run_gsm8k.sh
@@ -15,7 +15,7 @@ set -x
 : "${LOGGER:=wandb}" # change to "console" to print to stdout / or use wandb
 : "${INFERENCE_BACKEND:=vllm}"
 : "${MINI_BATCH_SIZE:=256}"
-# 256 of 341 in-flight groups finish before the cut: 25% of the in-flight groups resume each step.
+# 256 of 341 in-flight groups finish before each step: about 25% of the in-flight groups resume each step.
 : "${NUM_PARALLEL_GENERATION_WORKERS:=341}"
 
 SEQUENCE_MASK_METRIC=geometric

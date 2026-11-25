@@ -638,9 +638,9 @@ Validated in `validate_inference_engine_cfg`. vLLM-version coupled (mirrors `GPU
 
 ## Frozen-request sync for colocated partial rollout
 
-`PartialRolloutRayPPOTrainer` (`skyrl/train/partial_rollout_trainer.py`, `colocate_all=true`) reuses the same allocator methods so that requests cut mid-generation survive training on the shared GPUs. The inference engines must free the GPUs for training without aborting the in-flight requests:
+`PartialRolloutRayPPOTrainer` (`skyrl/train/partial_rollout_trainer.py`, `colocate_all=true`) reuses the same KEEP pause and allocator methods as the fully-async path above, so that in-flight requests stay paused through training on the shared GPUs and resume under the new weights. It is the same pause/resume, held longer: the engines must free the GPUs for training without aborting the in-flight requests:
 
-1. **Cut** — the trainer's `_before_training_step` calls `RemoteInferenceClient.sleep_with_frozen_requests(offload_kv)`: `pause_generation()` (KEEP) then `sleep_for_weight_sync(offload_kv, offload_weights=uses_lora_weight_sync)`. It sets `requests_frozen_asleep=True` and records `frozen_kv_offloaded=offload_kv`. The trainer passes `offload_kv = not clear_kv_cache_on_weight_sync`.
+1. **Pause** — the trainer's `_before_training_step` calls `RemoteInferenceClient.sleep_with_frozen_requests(offload_kv)`: `pause_generation()` (KEEP) then `sleep_for_weight_sync(offload_kv, offload_weights=uses_lora_weight_sync)`. It sets `requests_frozen_asleep=True` and records `frozen_kv_offloaded=offload_kv`. The trainer passes `offload_kv = not clear_kv_cache_on_weight_sync`.
 2. **Train** — the trainer model trains on the freed GPUs, and the step's checkpoint (if any) is written while the engines still sleep (`_checkpoint_before_weight_sync` returns True).
 3. **Sync** — `save_weights_for_sampler` first runs `_prepare_for_weight_sync`, which does **not** call `sleep()` while `_engines_hold_frozen_requests()` is true: `sleep()` goes through `/sleep`, which aborts the paused requests. It then takes its frozen branch: `_assert_frozen_requests_have_a_kv_cache_source()` → `wake_for_weight_sync(["weights"])` → broadcast → `wake_for_weight_sync(["kv_cache"])` → `resume_generation()`. `resume()` clears `requests_frozen_asleep`.
 

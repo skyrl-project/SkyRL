@@ -26,7 +26,8 @@ class FullyAsyncPPOExp(BasePPOExp):
         colocate_pg,
     ):
         # With colocated inference engines, generation cannot overlap training. The partial-rollout
-        # trainer cuts the in-flight groups for each step and resumes them after the weight sync.
+        # trainer keeps the in-flight requests paused through training and resumes them after the
+        # weight sync, the same pause and resume that fully-async training does at each weight sync.
         trainer_cls = PartialRolloutRayPPOTrainer if cfg.trainer.placement.colocate_all else FullyAsyncRayPPOTrainer
         return trainer_cls(
             cfg=cfg,

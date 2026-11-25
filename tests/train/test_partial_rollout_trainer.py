@@ -1,7 +1,7 @@
 """CPU tests for colocated partial rollout.
 
 The tests cover the admission controller of the partial-rollout trainer, the order of engine sleep,
-training, checkpoint and weight sync in one step, and the handling of the KV cache at the cut. The client side is in
+training, checkpoint and weight sync in one step, and the handling of the KV cache of the paused requests. The client side is in
 ``tests/backends/skyrl_train/inference_servers/test_remote_inference_client_resume.py``."""
 
 import asyncio
@@ -32,8 +32,8 @@ async def test_admission_without_staleness_holds_slot_until_trained():
     """A group holds its slot from submission until the step that trains on it.
 
     A finished group that waits in the buffer still holds its slot. So running + buffered never exceeds
-    the in-flight bound, which is also the buffer size, and the cut fraction is
-    1 - mini_batch / in_flight. There is no staleness term."""
+    the in-flight bound, which is also the buffer size, and the fraction of in-flight groups still
+    generating at each weight sync is 1 - mini_batch / in_flight. There is no staleness term."""
     ctrl = _PartialRolloutAdmissionController(
         max_concurrent_generation_groups=3, mini_batch_size=2, max_staleness_steps=0
     )
@@ -104,7 +104,8 @@ def test_buffer_size_follows_max_staleness_steps():
 
 
 def test_does_not_bound_staleness():
-    """A group survives any number of cuts, so the loop must not warn about groups past max_staleness_steps."""
+    """Any number of policy versions can generate one trajectory, so the loop must not warn about groups
+    past max_staleness_steps."""
     cfg = _partial_cfg()
     cfg.trainer.fully_async.max_staleness_steps = 0
     assert _partial_trainer(MagicMock(), cfg=cfg)._bounds_staleness() is False
@@ -207,14 +208,14 @@ def test_partial_rollout_step_sleeps_trains_checkpoints_then_syncs(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# The cut: paused requests and their KV cache
+# The pause before training: paused requests and their KV cache
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("clear_kv_cache, offload_kv", [(False, True), (True, False)])
-async def test_cut_sleeps_with_frozen_requests(clear_kv_cache, offload_kv):
-    """The cut aborts no request. ``clear_kv_cache_on_weight_sync`` selects whether the sleep copies
+async def test_pause_before_training_sleeps_with_frozen_requests(clear_kv_cache, offload_kv):
+    """The pause aborts no request. ``clear_kv_cache_on_weight_sync`` selects whether the sleep copies
     the KV cache to host memory or discards it."""
     client = MagicMock()
     client.sleep = AsyncMock()
@@ -222,13 +223,11 @@ async def test_cut_sleeps_with_frozen_requests(clear_kv_cache, offload_kv):
     cfg = _partial_cfg()
     cfg.trainer.fully_async.clear_kv_cache_on_weight_sync = clear_kv_cache
     trainer = _partial_trainer(client, cfg=cfg)
-    trainer._staleness_manager._stat.running = 2
 
     await trainer._before_training_step()
 
     client.sleep_with_frozen_requests.assert_awaited_once_with(offload_kv=offload_kv)
     assert client.sleep.await_count == 0
-    assert trainer.all_metrics["partial_rollout/groups_cut"] == 2
 
 
 def test_accepts_lora():

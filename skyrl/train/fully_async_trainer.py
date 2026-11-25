@@ -740,6 +740,9 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     # 4. After training: pause generation, sync weights, resume. `Timer` adds to
                     # `timing/step`. The weight sync has its own `step_timeout_s` budget, so a run that
                     # sets only `step_timeout_s` still bounds it.
+                    # The groups still generating now are paused across the weight sync and resume
+                    # under the new policy version.
+                    self.all_metrics["async/groups_in_flight_at_weight_sync"] = self._staleness_manager._stat.running
                     async with self._step_deadline(), Timer("step", self.all_timings):
                         await self._sync_weights_after_training_step()
 

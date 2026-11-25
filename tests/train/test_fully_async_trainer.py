@@ -400,3 +400,6 @@ def test_subclass_hooks_run_in_order_around_the_step(monkeypatch):
         "after_loop",
         "ckpt",
     ], order
+    # Each step logs the groups still generating at its weight sync.
+    logged = [c.args[0] for c in trainer.tracker.log.call_args_list]
+    assert sum("async/groups_in_flight_at_weight_sync" in payload for payload in logged) == 2
