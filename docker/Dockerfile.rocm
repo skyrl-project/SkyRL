@@ -46,6 +46,18 @@ ENV FLA_TILELANG=0
 # ROCm 10.1 fixes hipBLASLt: remove this variable once the parent image is on ROCm 10.1.
 ENV TENSILE_STREAMK_DYNAMIC_GRID=0
 
+# Without this, a weight sync over NCCL from a Megatron trainer whose experts span 8 GPUs gives the
+# inference engines wrong expert weights, with no error (RCCL 2.30.4, Qwen3.5-35B-A3B at TP2 and EP8).
+# vLLM's packed sender gathers the next chunk from the trainer's ranks on a second GPU stream while the
+# chunk before is still being broadcast, and the gathered tensors are then read before the other ranks'
+# rows have arrived. The variable makes RCCL launch the operations of all communicators on a device in
+# the order the host issued them. NCCL on NVIDIA delivers the right weights without it.
+# Cost: a training step of that model takes about 6% longer, in the trainer's forward pass and update.
+# TODO: send through one packed buffer instead (vLLM's `packed_num_buffers=1`, which SkyRL's NCCL sender
+# in skyrl/backends/skyrl_train/weight_sync/weight_senders.py does not pass today). That is also right,
+# costs no step time, and needs no variable; remove this one then.
+ENV NCCL_LAUNCH_ORDER_IMPLICIT=1
+
 RUN apt-get update -y && apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
