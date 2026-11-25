@@ -8,7 +8,8 @@
 - ``FakeTrial``: what Harbor's ``Trial`` is to the generator. Its task path picks
   a script: a linear chat, a summarization (the history is rewritten), a
   discarded reply asked again for (mini-swe-agent's format-error retry), a
-  timeout, an agent that exits on skycap's context-length error (``overflow``), a crash, or a sandbox that times out starting on the first attempt
+  timeout, an agent that exits on skycap's context-length error (``overflow``), one that raises it from the
+  generator's process (``overflow_in_process``), a crash, or a sandbox that times out starting on the first attempt
   (``slow_start``; "first" counts every trial of that task path since
   ``FakeTrial.configs`` was reset, so a test runs one such trial). Results carry Harbor's phase timings: the sandbox takes
   ``SETUP`` seconds to start, the agent ``AGENT`` and the verifier ``VERIFY``.
@@ -242,6 +243,15 @@ class FakeTrial:
                 )
                 result.trial_uri = trial_dir.as_uri()
                 return result
+            if script == "overflow_in_process":
+                # An agent calling LiteLLM from the generator's process (Tmax's Vanillux2): LiteLLM raises skycap's
+                # 400 as a plain BadRequestError, the agent lets it out, and Harbor runs no verifier.
+                return verified(
+                    1.0,
+                    "BadRequestError",
+                    message='litellm.BadRequestError: Hosted_vllmException - {"error":{"message":"prompt of 65622 '
+                    'tokens leaves no room within max_model_len=65536","code":"context_length_exceeded"}}',
+                )
             history += [{"role": "user", "content": "ok"}]
             if script == "discard":
                 # As mini-swe-agent on a format error: the reply is dropped from the history and the

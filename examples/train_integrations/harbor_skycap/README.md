@@ -30,6 +30,9 @@ Harbor's `TrialConfig`, with defaults from `../harbor/harbor_trial_config/defaul
 the idle TTL, the renderer pool size, which paths train and how agents inside
 remote sandboxes reach skycap ([below](#agents-inside-remote-sandboxes)).
 
+[`tmax/`](tmax) is a complete recipe: Tmax's terminal tasks with Tmax's own
+harness, evaluated on TB-Lite.
+
 ## Which paths train
 
 `skycap.train_paths` picks the rows of each rollout:

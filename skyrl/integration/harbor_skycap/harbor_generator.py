@@ -63,8 +63,11 @@ MAX_NUM_RETRIES_PER_TRIAL = 2
 #: classifies; an installed agent that exits on skycap's 400 (code ``context_length_exceeded``, which LiteLLM
 #: may raise as a plain ``BadRequestError``) is only a ``NonZeroAgentExitCodeError``. Its message keeps just the
 #: first 1000 characters of the agent's output, which end before the error, so the end of the agent's own log in
-#: the trial directory is searched too. Rich wraps that log, possibly inside the code.
+#: the trial directory is searched too. Rich wraps that log, possibly inside the code. An agent that calls LiteLLM from
+#: this process (Tmax's Vanillux2) raises the ``BadRequestError`` itself, with skycap's 400 in its message.
 CONTEXT_LENGTH_EXCEPTIONS = {"ContextLengthExceededError", "ContextWindowExceededError"}
+#: The exceptions whose message, and agent log, may show a context-length error.
+CONTEXT_LENGTH_CARRIERS = {"NonZeroAgentExitCodeError", "BadRequestError"}
 CONTEXT_LENGTH_OUTPUT = re.compile(r"context\s*_length\s*_exceeded|ContextWindowExceededError")
 #: How much of the end of each agent log is searched.
 AGENT_LOG_TAIL_BYTES = 64 * 1024
@@ -75,7 +78,7 @@ def _ran_out_of_context(results: Any) -> bool:
     exception = results.exception_info.exception_type if results.exception_info else None
     if exception in CONTEXT_LENGTH_EXCEPTIONS:
         return True
-    if exception != "NonZeroAgentExitCodeError":
+    if exception not in CONTEXT_LENGTH_CARRIERS:
         return False
     if CONTEXT_LENGTH_OUTPUT.search(results.exception_info.exception_message or ""):
         return True
