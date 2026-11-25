@@ -7,7 +7,7 @@ SkyRL uses Megatron-Bridge for HF-to-Megatron model conversion. Installed from g
 ## Key abstractions
 - `MegatronConfig` in `skyrl/train/config.py`
 - `MegatronWorker` in `skyrl/backends/skyrl_train/workers/megatron/megatron_worker.py`.
-- Custom bridges in `skyrl/backends/skyrl_train/workers/megatron/model_bridges.py` (e.g., `GLM47FlashBridge`).
+- Custom bridges in `skyrl/backends/skyrl_train/workers/megatron/model_bridges.py` (e.g., `KimiK25TextBridge`).
 - GLM-5.3-Flash (`glm5_next`): `skyrl/backends/skyrl_train/patches/megatron/glm5_next/` (provider, block
   spec, bridge; Megatron-Bridge-shaped) on top of `skyrl/backends/skyrl_train/patches/megatron/mcore_ext/`
   (Megatron-Core-shaped: `hyper_connection.py` backport of Megatron-LM main's mHC module,

@@ -692,6 +692,8 @@ class MegatronConfig(BaseConfig):
     )
     """Pass-through kwargs for Megatron's ``TransformerConfig``:
     https://github.com/NVIDIA/Megatron-LM/blob/core_r0.13.0/megatron/core/transformer/transformer_config.py
+    Each key must be a field of ``TransformerConfig`` or of the model's Megatron-Bridge provider
+    (e.g. ``should_pad_vocab``); any other key raises an error when the model is built.
     Also the place to put HuggingFace config overrides (e.g. ``rope_parameters``) for the Megatron
     backend, where FSDP would use ``model_config_kwargs``.
 

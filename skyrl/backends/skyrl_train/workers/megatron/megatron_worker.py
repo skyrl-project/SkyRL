@@ -508,6 +508,17 @@ class MegatronWorker:
                 fp8_exclude_recipe(list(megatron_config.fp8_exclude_modules))
             )
 
+        # The provider is a dataclass, so setattr accepts any name: a key that is neither one of its fields
+        # nor an attribute its bridge set would be stored and never read.
+        provider_settings = {f.name for f in dataclasses.fields(provider)} | set(vars(provider))
+        unknown = sorted(set(transformer_config_kwargs) - provider_settings)
+        if unknown:
+            raise ValueError(
+                f"megatron_config.transformer_config_kwargs sets {unknown}, which {type(provider).__name__} "
+                "does not have, so Megatron would ignore them. Keys must be fields of Megatron's "
+                "TransformerConfig or of this model's provider."
+            )
+
         # Apply any additional transformer config kwargs (can override the above).
         for k, v in transformer_config_kwargs.items():
             setattr(provider, k, v)
