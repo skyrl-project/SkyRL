@@ -18,6 +18,7 @@ from skyrl.backends.skyrl_train.inference_servers.engine_utils import (
 from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
 from skyrl.backends.skyrl_train.utils.ppo_utils import PolicyLossType
 from skyrl.backends.skyrl_train.utils.torch_utils import logprobs_from_logits
+from skyrl.backends.skyrl_train.weight_sync.sources import is_megatron_mtp_param
 from skyrl.train.config import (
     SkyRLLoraConfig,
     SkyRLTrainConfig,
@@ -27,6 +28,11 @@ from skyrl.train.fused_lm_head import FusedLmHeadBackend
 from skyrl.train.utils.utils import (
     print_mem,
     validate_cfg,
+)
+from tests.backends.skyrl_train.gpu.gpu_ci.megatron.test_mtp_weight_sync import (
+    MtpExportPolicyWorker,
+    MtpFingerprintWorker,
+    _assert_draft_matches_megatron_export,
 )
 from tests.backends.skyrl_train.gpu.utils import (
     InferenceEngineState,
@@ -43,6 +49,8 @@ MODEL_NAME = "Qwen/Qwen3-0.6B"
 # this might be a model specific mbridge issue - see if this persists when we transition to Megatron-Bridge
 # MOE_MODEL_NAME = "Qwen/Qwen1.5-MoE-A2.7B"
 MOE_MODEL_NAME = "Qwen/Qwen3-30B-A3B"
+# Dense: sharded_rdt cannot bake the GatedDeltaNet layers of Qwen3.5, the MTP tests' other model.
+MTP_MODEL_NAME = "XiaomiMiMo/MiMo-7B-RL"
 
 
 def get_test_actor_config(model_name=MODEL_NAME) -> SkyRLTrainConfig:
@@ -121,6 +129,18 @@ def get_test_training_batch(batch_size=4) -> TrainingInputBatch:
     return data
 
 
+class _MtpPolicyWorker(MtpExportPolicyWorker):
+    def skyrl_move_mtp_head(self) -> int:
+        """Move the MTP head off the checkpoint the engines booted from, so only a synced drafter matches it."""
+        params = [p for chunk in self.actor_module for n, p in chunk.named_parameters() if is_megatron_mtp_param(n)]
+        for param in params:
+            param.data.add_(1)
+        return len(params)
+
+    def skyrl_holds_mtp_head(self) -> bool:
+        return any("mtp" in name for name in self._weight_sync_engine.source.held_names() or [])
+
+
 @pytest.mark.parametrize(
     (
         "weight_sync_backend",
@@ -132,12 +152,13 @@ def get_test_training_batch(batch_size=4) -> TrainingInputBatch:
         "megatron_etp",
         "lora",
         "num_engines",
+        "mtp",
     ),
     [
-        pytest.param("nccl", True, 4, 2, 2, 1, None, False, 1, id="nccl_colocate_all"),
-        pytest.param("nccl", False, 2, 2, 1, 1, None, False, 1, id="nccl_non_colocated"),
-        pytest.param("nccl", True, 4, 2, 2, 1, None, True, 1, id="nccl_colocate_all_lora"),
-        # sharded_rdt (NIXL pull): non-colocated only. Both variants fit 4 GPUs --
+        pytest.param("nccl", True, 4, 2, 2, 1, None, False, 1, False, id="nccl_colocate_all"),
+        pytest.param("nccl", False, 2, 2, 1, 1, None, False, 1, False, id="nccl_non_colocated"),
+        pytest.param("nccl", True, 4, 2, 2, 1, None, True, 1, False, id="nccl_colocate_all_lora"),
+        # sharded_rdt (NIXL pull): non-colocated only. All variants fit 4 GPUs --
         # policy world = megatron_tp*megatron_pp, engines = inference_tp*num_engines.
         #
         #   TP2/TP2:  2 policy + 1 engine x TP2  = 4. Trainer TP gather feeding an
@@ -148,8 +169,13 @@ def get_test_training_batch(batch_size=4) -> TrainingInputBatch:
         #             only its own layers via held_names), AND num_engines>1, so the
         #             consumer ids are offset per deployment by replica_rank -- the
         #             M:N path that deadlocked before that fix.
-        pytest.param("sharded_rdt", False, 2, 2, 1, 1, None, False, 1, id="sharded_rdt_infer_tp2_trainer_tp2"),
-        pytest.param("sharded_rdt", False, 1, 1, 2, 1, None, False, 2, id="sharded_rdt_infer_tp1_trainer_pp2_2engines"),
+        #   + MTP:    TP1/PP2 with trainer.mtp and vLLM drafting with MTP: the head sits on the
+        #             last stage, whose PP-local walk syncs it into each engine's drafter.
+        pytest.param("sharded_rdt", False, 2, 2, 1, 1, None, False, 1, False, id="sharded_rdt_infer_tp2_trainer_tp2"),
+        pytest.param(
+            "sharded_rdt", False, 1, 1, 2, 1, None, False, 2, False, id="sharded_rdt_infer_tp1_trainer_pp2_2engines"
+        ),
+        pytest.param("sharded_rdt", False, 1, 1, 2, 1, None, False, 2, True, id="sharded_rdt_mtp_trainer_pp2_2engines"),
     ],
 )
 @pytest.mark.asyncio
@@ -165,12 +191,14 @@ async def test_megatron_policy_weight_sync(
     megatron_etp,
     lora,
     num_engines,
+    mtp,
 ):
     """
     Test that we can sync weights between policy and inference for megatron then run inference
     """
+    model = MTP_MODEL_NAME if mtp else MODEL_NAME
     try:
-        cfg = get_test_actor_config(model_name=MODEL_NAME)
+        cfg = get_test_actor_config(model_name=model)
         if lora:
             cfg.trainer.policy.model.lora = SkyRLLoraConfig(rank=16, alpha=16)
         cfg.trainer.placement.colocate_all = colocate_all
@@ -184,11 +212,22 @@ async def test_megatron_policy_weight_sync(
         cfg.trainer.policy.megatron_config.pipeline_model_parallel_size = megatron_pp
         cfg.trainer.policy.megatron_config.expert_model_parallel_size = megatron_ep
         cfg.trainer.policy.megatron_config.expert_tensor_parallel_size = megatron_etp
+        if mtp:
+            cfg.trainer.mtp.enabled = True
+            cfg.trainer.policy.megatron_config.mtp_num_layers = None  # zeroed by the first validate_cfg
+            cfg.trainer.policy.inference_only_init = True  # no optimizer, so the 7B fits the CI GPUs
+            cfg.generator.inference_engine.engine_init_kwargs = {
+                "max_model_len": 2048,
+                "worker_extension_cls": f"{MtpFingerprintWorker.__module__}.MtpFingerprintWorker",
+            }
+            placement = cfg.trainer.placement  # the policy world, for validate_cfg
+            placement.policy_num_gpus_per_node = placement.ref_num_gpus_per_node = megatron_tp * megatron_pp
+            validate_cfg(cfg)  # sets the engines' MTP speculative_config
 
         # If colocate is True, this will load the engine, sleep, and wake up the engine
         async with InferenceEngineState.create(
             cfg=cfg,
-            model=MODEL_NAME,
+            model=model,
             use_local=True,
             backend="vllm",
             num_inference_engines=num_engines,
@@ -205,7 +244,10 @@ async def test_megatron_policy_weight_sync(
                 # necessarily inference_tp (e.g. inference TP1 + trainer PP2).
                 num_gpus_per_node=megatron_tp * megatron_pp,
                 cfg=cfg,
+                worker_cls=ray.remote(num_gpus=1)(_MtpPolicyWorker) if mtp else None,
             )
+            if mtp:
+                assert sum(ray.get(policy.async_run_ray_method("pass_through", "skyrl_move_mtp_head"))) > 0
             ray.get(
                 policy.async_run_ray_method(
                     "pass_through", "init_weight_sync_state", client, cfg.generator.inference_engine
@@ -222,14 +264,19 @@ async def test_megatron_policy_weight_sync(
                         "pass_through", "broadcast_to_inference_engines", client, cfg.generator.inference_engine
                     )
                 )
+            if mtp:
+                # The sync ran the PP-local walk (no whole-model fallback), with the head on the last stage; and
+                # every drafter tensor in every engine matches the trainer's export, in the engine's dtype.
+                assert ray.get(policy.async_run_ray_method("pass_through", "skyrl_holds_mtp_head")) == [False, True]
+                await _assert_draft_matches_megatron_export(client, policy)
 
             policy.offload_to_cpu()
             await client.wake_up(tags=["kv_cache"])
             sampling_params = get_sampling_params_for_backend(
                 cfg.generator.inference_engine.backend, cfg.generator.sampling_params
             )
-            tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
-            outputs = await run_inference(client, get_test_prompts(MODEL_NAME), sampling_params, tokenizer=tokenizer)
+            tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+            outputs = await run_inference(client, get_test_prompts(model), sampling_params, tokenizer=tokenizer)
 
             print(f"Example output: {outputs['responses'][0]}, {outputs['stop_reasons'][0]}")
     finally:

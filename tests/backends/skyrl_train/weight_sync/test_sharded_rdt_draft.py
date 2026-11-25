@@ -1,0 +1,349 @@
+"""CPU tests for syncing a spec-decode drafter over ``sharded_rdt``.
+
+The consumer engine bakes the drafter's own modules in the target's sessions: the target's
+``load_weights`` skips the MTP layer's names, and the drafter's picks them out of the rest, as both do
+from a full checkpoint at engine load. Runs vLLM's real layerwise reload over a toy target and a toy
+drafter that shares the target's embedding and LM head, as vLLM's MTP drafters do.
+"""
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+pytest.importorskip("vllm")
+
+from vllm.model_executor.layers.attention_layer_base import (  # noqa: E402
+    AttentionLayerBase,
+)
+from vllm.model_executor.model_loader import reload  # noqa: E402
+from vllm.model_executor.model_loader.reload import (  # noqa: E402
+    record_metadata_for_reloading,
+)
+from vllm.model_executor.model_loader.weight_utils import (  # noqa: E402
+    default_weight_loader,
+)
+
+from skyrl.backends.skyrl_train.inference_servers.draft_model import (  # noqa: E402
+    attach_draft_model,
+)
+from skyrl.backends.skyrl_train.patches.vllm import (  # noqa: E402
+    patch_moe_kernel_constants,
+)
+from skyrl.backends.skyrl_train.weight_sync.sharded_rdt.sharded_rdt_engine import (  # noqa: E402
+    SkyRLShardedRDTWeightTransferEngine,
+    _split_modules,
+    _unshared_submodules,
+)
+
+pytestmark = pytest.mark.vllm
+
+
+def _load(module, weights, own):
+    """Load the names ``own`` accepts and skip the rest, as vLLM's models do with a full checkpoint."""
+    params = dict(module.named_parameters())
+    loaded = set()
+    for name, tensor in weights:
+        if not own(name):
+            continue
+        param = params[name]
+        getattr(param, "weight_loader", default_weight_loader)(param, tensor)
+        loaded.add(name)
+    return loaded
+
+
+class _Target(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embed_tokens = torch.nn.Embedding(8, 4)
+        self.lm_head = torch.nn.Linear(4, 8, bias=False)
+
+    def load_weights(self, weights):
+        return _load(self, weights, lambda name: not name.startswith("layers.2."))
+
+
+class _SharedHead(torch.nn.Module):
+    def __init__(self, head):
+        super().__init__()
+        self.norm = torch.nn.LayerNorm(4)
+        self.head = head
+
+
+class _MtpLayer(torch.nn.Module):
+    def __init__(self, head):
+        super().__init__()
+        self.eh_proj = torch.nn.Linear(8, 4, bias=False)
+        self.shared_head = _SharedHead(head)
+
+
+class _Draft(torch.nn.Module):
+    """vLLM's MTP drafter, reduced: its embedding and output head are the target's modules."""
+
+    def __init__(self, target):
+        super().__init__()
+        self.embed_tokens = target.embed_tokens
+        self.layers = torch.nn.ModuleDict({"2": _MtpLayer(target.lm_head)})
+
+    def load_weights(self, weights):
+        return _load(self, weights, lambda name: name.startswith("layers.2."))
+
+
+class _DraftWithOwnHead(_Draft):
+    """A drafter whose LM head is its own, not the target's: the target's load_weights takes its name."""
+
+    def __init__(self, target):
+        super().__init__(target)
+        self.lm_head = torch.nn.Linear(4, 8, bias=False)
+
+    def load_weights(self, weights):
+        return _load(self, weights, lambda name: name.startswith("layers.2.") or name == "lm_head.weight")
+
+
+class _DraftWithKvScales(_Draft):
+    """A drafter holding vLLM's attention layer under a quantized KV cache: scale params no checkpoint needs."""
+
+    def __init__(self, target):
+        super().__init__(target)
+        self.attn = torch.nn.Module()
+        self.attn.k_scale = torch.nn.Parameter(torch.tensor(-1.0), requires_grad=False)
+
+
+class _DraftSharingNothing(_Draft):
+    """A drafter with its own embedding and LM head: it shares no module with the target, so it is one unshared unit."""
+
+    def __init__(self, target):
+        super().__init__(target)
+        self.embed_tokens = torch.nn.Embedding(8, 4)
+        self.layers["2"].shared_head.head = torch.nn.Linear(4, 8, bias=False)
+
+
+class _TargetWithRope(_Target):
+    """A target whose layers hold the rotary embedding vLLM's ``get_rope`` caches once per process."""
+
+    def __init__(self):
+        super().__init__()
+        self.rotary_emb = torch.nn.Identity()
+
+
+class _MlaAttention(torch.nn.Module, AttentionLayerBase):
+    """Absorbed MLA, reduced: ``W_UV`` is derived from ``kv_b_proj`` after loading; the rope is the target's."""
+
+    def __init__(self, rotary_emb):
+        super().__init__()
+        self.kv_b_proj = torch.nn.Linear(4, 4, bias=False)
+        self.rotary_emb = rotary_emb
+        self.W_UV = None
+
+    def get_attn_backend(self):
+        raise NotImplementedError
+
+    def get_kv_cache_spec(self, vllm_config):
+        return None
+
+    def process_weights_after_loading(self, act_dtype):
+        self.W_UV = self.kv_b_proj.weight.detach().to(act_dtype).T.clone()
+
+
+class _DraftWithSplitAttention(_Draft):
+    """A drafter whose attention layer holds a module of the target, as DeepSeek-V3.2's MTP block does."""
+
+    def __init__(self, target):
+        super().__init__(target)
+        self.layers["2"].self_attn = _MlaAttention(target.rotary_emb)
+
+
+TARGET_NAMES = {"embed_tokens.weight": [8, 4], "lm_head.weight": [8, 4]}
+DRAFT_NAMES = {
+    "layers.2.eh_proj.weight": [4, 8],
+    "layers.2.shared_head.norm.weight": [4],
+    "layers.2.shared_head.norm.bias": [4],
+}
+
+
+def _engine(names, draft_cls=_Draft, target_cls=_Target):
+    target = target_cls()
+    draft = draft_cls(target)
+    record_metadata_for_reloading(target)
+    record_metadata_for_reloading(draft)
+    engine = SkyRLShardedRDTWeightTransferEngine.__new__(SkyRLShardedRDTWeightTransferEngine)
+    engine.model, engine.device = target, torch.device("cpu")
+    engine._name_to_plan, engine._post_load_fns, engine._draft = {}, {}, None
+    engine.skyrl_set_draft_model(draft, SimpleNamespace())
+    init_info = SimpleNamespace(names=list(names), dtype_names=["float32"] * len(names), shapes=list(names.values()))
+    return engine, target, draft, init_info
+
+
+def test_unshared_submodules_keeps_the_target_modules_out():
+    target = _Target()
+    draft = _Draft(target)
+    layer = draft.layers["2"]
+    assert list(_unshared_submodules(draft, target)) == [layer.eh_proj, layer.shared_head.norm]
+
+
+def test_bake_plans_the_drafter_layers_on_the_drafter_and_restores_both_models():
+    engine, target, draft, init_info = _engine({**TARGET_NAMES, **DRAFT_NAMES})
+
+    engine._bake(init_info)
+
+    layer = draft.layers["2"]
+    owner = {name: {sc.layer for sc in plan} for name, plan in engine._name_to_plan.items()}
+    assert owner == {
+        "embed_tokens.weight": {target.embed_tokens},
+        "lm_head.weight": {target.lm_head},
+        "layers.2.eh_proj.weight": {layer.eh_proj},
+        "layers.2.shared_head.norm.weight": {layer.shared_head.norm},
+        "layers.2.shared_head.norm.bias": {layer.shared_head.norm},
+    }
+    assert engine._live_names == set(TARGET_NAMES) | set(DRAFT_NAMES)
+    # The dry run leaves every param real, the shared ones included.
+    assert not any(p.is_meta for p in [*target.parameters(), *draft.parameters()])
+
+
+def test_start_weight_update_reloads_the_drafter_but_not_the_shared_modules_twice():
+    engine, target, draft, _ = _engine(TARGET_NAMES)
+    engine.start_weight_update()
+    layer = draft.layers["2"]
+    assert layer.eh_proj.weight.is_meta and layer.shared_head.norm.weight.is_meta
+    # The target's own reload owns the shared modules.
+    assert target.embed_tokens.weight.is_meta and target.lm_head.weight.is_meta
+
+
+def test_finish_weight_update_restores_the_drafters_moe_kernel_constants_too(monkeypatch):
+    """A sleep for the sync zeroes the MoE kernel constants of the drafter's experts as well as the target's."""
+    restored = []
+    monkeypatch.setattr(reload, "finalize_layerwise_reload", lambda model, model_config: None)
+    monkeypatch.setattr(patch_moe_kernel_constants, "restore_moe_kernel_constants", restored.append)
+    engine, target, draft, _ = _engine(TARGET_NAMES)
+    engine.model_config = None
+    engine.drain_pending = lambda: None
+
+    engine.finish_weight_update()
+
+    assert restored == [target, draft]
+
+
+def test_bake_refuses_a_plan_without_drafter_layers():
+    engine, _, _, init_info = _engine(TARGET_NAMES)
+    with pytest.raises(RuntimeError, match="loads nothing into the spec-decode drafter"):
+        engine._bake(init_info)
+
+
+def test_bake_refuses_a_drafter_module_the_plan_leaves_unloaded():
+    engine, _, _, init_info = _engine({**TARGET_NAMES, **DRAFT_NAMES}, draft_cls=_DraftWithOwnHead)
+    with pytest.raises(RuntimeError, match=r"drafter's \['lm_head'\]"):
+        engine._bake(init_info)
+
+
+def test_bake_refuses_any_unloaded_module_of_a_drafter_that_shares_nothing():
+    names = {**TARGET_NAMES, **DRAFT_NAMES, "layers.2.shared_head.head.weight": [8, 4]}
+    engine, _, draft, init_info = _engine(names, draft_cls=_DraftSharingNothing)
+    assert list(engine._draft.unshared) == [draft]
+    # Its MTP layer loads; its embedding, whose name the target consumed, does not.
+    with pytest.raises(RuntimeError, match=r"drafter's \['embed_tokens'\]"):
+        engine._bake(init_info)
+
+
+def test_bake_accepts_a_drafter_module_with_only_kv_cache_scales():
+    engine, _, _, init_info = _engine({**TARGET_NAMES, **DRAFT_NAMES}, draft_cls=_DraftWithKvScales)
+    engine._bake(init_info)
+
+
+def test_split_modules_finds_the_attention_layer_unshared_holds_only_in_parts():
+    target = _TargetWithRope()
+    draft = _DraftWithSplitAttention(target)
+    layer = draft.layers["2"]
+    unshared = _unshared_submodules(draft, target)
+    assert layer.self_attn.kv_b_proj in list(unshared) and layer.self_attn not in list(unshared)
+    # The containers above a shared module are split too; only the attention layer needs a rebuild.
+    assert _split_modules(draft, target, unshared) == [draft, draft.layers, layer, layer.shared_head, layer.self_attn]
+
+
+def test_split_modules_leaves_a_whole_attention_layer_to_the_finalize():
+    target = _TargetWithRope()
+    draft = _DraftWithSplitAttention(target)
+    attn = draft.layers["2"].self_attn
+    attn.rotary_emb = torch.nn.Identity()  # its own rope: the layer is in ``unshared`` as a whole
+    assert attn not in _split_modules(draft, target, _unshared_submodules(draft, target))
+
+
+SPLIT_NAMES = {**TARGET_NAMES, **DRAFT_NAMES, "layers.2.self_attn.kv_b_proj.weight": [4, 4]}
+
+
+def test_bake_accepts_a_split_attention_layer_whose_params_are_all_in_its_children():
+    engine, _, draft, init_info = _engine(SPLIT_NAMES, _DraftWithSplitAttention, _TargetWithRope)
+    engine._bake(init_info)
+    assert "layers.2.self_attn.kv_b_proj.weight" in engine._name_to_plan
+
+
+def test_bake_accepts_a_split_attention_layer_with_only_kv_cache_scales():
+    engine, _, draft, init_info = _engine(SPLIT_NAMES, _DraftWithSplitAttention, _TargetWithRope)
+    draft.layers["2"].self_attn.k_scale = torch.nn.Parameter(torch.tensor(-1.0), requires_grad=False)
+    engine._bake(init_info)
+
+
+def test_bake_refuses_a_split_module_that_owns_params():
+    """No reload reaches a param that a split module owns itself, so it would keep its boot value."""
+    engine, _, draft, init_info = _engine(SPLIT_NAMES, _DraftWithSplitAttention, _TargetWithRope)
+    draft.layers["2"].self_attn.gain = torch.nn.Parameter(torch.ones(4))
+    with pytest.raises(RuntimeError, match=r"layers\.2\.self_attn.*does not reload"):
+        engine._bake(init_info)
+
+
+def test_bake_refuses_a_split_module_with_a_quantization_method():
+    engine, _, draft, init_info = _engine(SPLIT_NAMES, _DraftWithSplitAttention, _TargetWithRope)
+    draft.layers["2"].shared_head.quant_method = object()
+    with pytest.raises(RuntimeError, match=r"layers\.2\.shared_head.*does not reload"):
+        engine._bake(init_info)
+
+
+def test_finish_weight_update_rebuilds_what_a_split_attention_layer_derives_from_its_weights(monkeypatch):
+    """The drafter's finalize walks ``unshared`` only, which holds the layer's ``kv_b_proj`` but not the layer."""
+    engine, target, draft, _ = _engine(TARGET_NAMES, _DraftWithSplitAttention, _TargetWithRope)
+    attn = draft.layers["2"].self_attn
+    attn.process_weights_after_loading(torch.float32)
+
+    def finalize(model, model_config):  # the sync lands new weights before the derived tensors are rebuilt
+        if model is not target:
+            with torch.no_grad():
+                attn.kv_b_proj.weight.add_(1.0)
+
+    monkeypatch.setattr(reload, "finalize_layerwise_reload", finalize)
+    monkeypatch.setattr(patch_moe_kernel_constants, "restore_moe_kernel_constants", lambda model: None)
+    engine.model_config, engine._draft = None, engine._draft._replace(config=SimpleNamespace(dtype=torch.float32))
+    engine.drain_pending = lambda: None
+
+    engine.finish_weight_update()
+
+    assert torch.equal(attn.W_UV, attn.kv_b_proj.weight.T)
+
+
+def _worker(engine, draft):
+    draft_cfg = SimpleNamespace()
+    return SimpleNamespace(
+        weight_transfer_engine=engine,
+        model_runner=SimpleNamespace(get_draft_model=lambda: draft),
+        vllm_config=SimpleNamespace(speculative_config=SimpleNamespace(draft_model_config=draft_cfg)),
+    )
+
+
+def test_attach_draft_model_hands_the_drafter_to_the_rdt_engine():
+    engine = SkyRLShardedRDTWeightTransferEngine.__new__(SkyRLShardedRDTWeightTransferEngine)
+    engine.model, engine._draft = _Target(), None
+    draft = _Draft(engine.model)
+    worker = _worker(engine, draft)
+    assert attach_draft_model(worker) is True
+    assert engine._draft.model is draft
+    assert engine._draft.config is worker.vllm_config.speculative_config.draft_model_config
+
+
+@pytest.mark.parametrize("engine", [SimpleNamespace(), None])  # no skyrl_set_draft_model, or no engine at all
+def test_attach_draft_model_fails_on_an_engine_that_cannot_take_the_drafter(engine):
+    with pytest.raises(AttributeError):
+        attach_draft_model(_worker(engine, torch.nn.Linear(1, 1)))
+
+
+def test_attach_draft_model_reports_a_worker_without_a_drafter():
+    engine = SkyRLShardedRDTWeightTransferEngine.__new__(SkyRLShardedRDTWeightTransferEngine)
+    engine.model, engine._draft = _Target(), None
+    assert attach_draft_model(_worker(engine, None)) is False
+    assert engine._draft is None

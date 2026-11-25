@@ -67,8 +67,16 @@ class MtpFingerprintWorker(NewInferenceWorkerWrap):
     """Compare the synced drafter with a fresh Megatron export."""
 
     def skyrl_compare_draft_to_megatron_export(self, path: str):
+        from vllm.model_executor.model_loader.reload.layerwise import (
+            _get_original_loader,
+        )
+
         draft = self._skyrl_draft_model()
         assert draft is not None, "MTP drafter missing after weight sync"
+        # A sharded_rdt sync leaves layerwise reload's loader wrapper on the qkv biases, which drops a direct load.
+        for param in draft.parameters():
+            if hasattr(param, "weight_loader"):
+                param.weight_loader = _get_original_loader(param)
         before = _parameter_hashes(draft)
         with safe_open(path, framework="pt", device="cpu") as checkpoint:
             names = list(checkpoint.keys())
