@@ -12,12 +12,15 @@ set -x
 #   -------------------------------------------+---------------------------------------------------
 #   6 trainer + 2 engine nodes, not colocated  | NVFP4 DP8 x EP8 engines -> online-FP8 TP8 engines
 #   16 prompts x 16 samples per step           | cpu_adamw_bf16         -> optimizer_offload_to_disk
-#   k=4 probabilistic drafts, hard-label loss  | TP1/CP16/PP3/EP16 DeepEP -> TP8/CP1/PP3/EP16 alltoall
+#   k=4 probabilistic drafts, hard-label loss  | TP1/CP16/PP3/EP16 DeepEP -> TP2/CP8/PP3/EP16 alltoall
 #   capture sizes up to max_num_seqs * (k+1)   | NVFP4 KV cache         -> bf16 KV cache
 #   sharded_rdt weight sync, top-k 128 / top-p 0.99
 #
-# STATUS: the MTP arm ran 6 steps on 8x8 B200 with WEIGHT_SYNC_BACKEND=nccl. The default sharded_rdt segfaults
-# at the first sync on Ray 2.57.0 (set-before-register race, fixed in Ray 2.58.0 by ray-project/ray#64558).
+# STATUS: ran on 8x8 B200. Step 2 of the MTP arm: policy_train ~160 s (disk optimizer ~64 s), step ~340 s,
+# 10.7 GiB free on the fullest trainer GPU. WEIGHT_SYNC_BACKEND=nccl works as is. The default sharded_rdt
+# needs two fixes that are not in this branch:
+#   1. Ray >= 2.58.0. Ray 2.57.0 segfaults at the first sync (set-before-register race, ray-project/ray#64558).
+#   2. A rebuild of the drafter's W_UK_T / W_UV after each sync. Without it the acceptance length is ~1.55.
 #
 #   bash examples/train/algorithms/dapo/prepare_dapo_data.sh
 #   bash examples/train/spec_decode/run_megatron_dapo_glm5.3_specdecode_port.sh                    # MTP
@@ -66,7 +69,7 @@ EVAL_INTERVAL="${EVAL_INTERVAL:--1}"
 MAX_PROMPT_LENGTH=2048
 MAX_RESPONSE_LENGTH=8192
 INFERENCE_ENGINE_MAX_MODEL_LEN=10752         # prompt + response + chat-template headroom
-MAX_TOKENS_PER_MICROBATCH=8192               # soft cap: a longer sequence gets a microbatch of its own
+MAX_TOKENS_PER_MICROBATCH=32768              # ~40 microbatches per step. 65536 runs out of memory.
 OVERLONG_BUFFER_LEN=$((1024 * 4))
 OVERLONG_BUFFER_PENALTY_FACTOR=1.0
 
@@ -84,24 +87,28 @@ TOP_P=0.99
 EVAL_TOP_P=0.7
 LR=1e-6
 
-# ---- trainer: TP8 / PP3 / EP16 on 48 GPUs (DP 2) ----
+# ---- trainer: TP2 / CP8 / PP3 / EP16 on 48 GPUs (DP 1) ----
 # 753B params: ~725B in 256 routed experts per layer, ~28B dense. PP3 puts a third of the layers on each
-# 16-GPU stage; EP16 puts 16 experts of each layer on a GPU: ~15B expert params, ~30 GiB bf16 weights plus
-# ~60 GiB fp32 main grads. The 8-node recipe's TP8 / EP64 does not fit 48 GPUs (48 is not a multiple of 64),
-# and PR 2808's TP1 / CP16 / EP16 needs the DeepEP flex dispatcher, which this tree could not run
-# (../glm5_3/throughput/README.md, "DeepEP / NCCL EP").
-MEGATRON_TP="${MEGATRON_TP:-8}"
+# 16-GPU stage; EP16 puts 16 experts of each layer on a GPU. bf16 weights plus the fp32 main grads that the
+# disk optimizer requires are ~6 B/param.
+# The step is bound by communication calls, not by compute, so fewer and larger microbatches are faster.
+# CP8 gives each GPU 1/8 of a microbatch, which makes a 32768-token microbatch fit. Measured alternatives:
+#   TP8 / CP1, 8192 tokens:   fits, ~90 microbatches per replica, policy_train ~100 s longer.
+#   TP8 / CP1, 16384 tokens:  out of memory.
+#   TP1 / CP16, 32768 tokens: out of memory in the optimizer step (the dense params are not split).
+#   TP2 / CP8, 65536 tokens:  out of memory.
+# The alltoall dispatcher runs this layout; DeepEP is not needed.
+MEGATRON_TP="${MEGATRON_TP:-2}"
 MEGATRON_PP="${MEGATRON_PP:-3}"
-MEGATRON_CP="${MEGATRON_CP:-1}"
+MEGATRON_CP="${MEGATRON_CP:-8}"
 MEGATRON_EP="${MEGATRON_EP:-16}"
 MEGATRON_ETP=1
 # The GLM-5 bridge needs one "|"-separated segment per pipeline stage, each starting on a layer that
 # computes its own DSA top-k. 26 / 28 / 24 layers is the split PR 2808 uses: 3 dense layers ("D-"), then
 # attention + MoE layers ("DE").
 HYBRID_LAYER_PATTERN="${HYBRID_LAYER_PATTERN:-D-D-D-$(printf 'DE%.0s' {1..23})|$(printf 'DE%.0s' {1..28})|$(printf 'DE%.0s' {1..24})}"
-# Full activation recompute, one layer at a time (as in PR 2808). With selective [moe] recompute this layout
-# reached the 178 GiB limit on 4 of 6 trainer nodes in step 1 and NCCL ran out of memory; full recompute peaks
-# at 148-170 GiB and costs ~78% more policy_train time.
+# Full activation recompute, one layer at a time (as in PR 2808). Selective [moe] recompute ran out of
+# memory at TP8 and was not tried on this layout (10.7 GiB of margin).
 RECOMPUTE_GRANULARITY="${RECOMPUTE_GRANULARITY:-full}"
 RECOMPUTE_METHOD="${RECOMPUTE_METHOD:-uniform}"
 RECOMPUTE_NUM_LAYERS="${RECOMPUTE_NUM_LAYERS:-1}"
@@ -115,7 +122,10 @@ export SKYRL_DSA_INDEXER_BACKEND=tilelang
 # The disk optimizer streams the state through the GPU one chunk at a time. It requires
 # grad_reduce_in_fp32=true, optimizer_cpu_offload=false and use_precision_aware_optimizer=false.
 OPTIMIZER_OFFLOAD_DIR="${OPTIMIZER_OFFLOAD_DIR:-/mnt/local_storage/skyrl_optimizer_offload}"
-OPTIMIZER_MOMENT_DTYPE="${OPTIMIZER_MOMENT_DTYPE:-fp32}"
+# bf16 moments: 8 B/param on disk, ~1.0 TB per trainer node, which stays in the page cache of a 2 TB host.
+# The optimizer step then reads nothing from disk: ~64 s against ~123 s with fp32 moments (~1.5 TB per node).
+# The update still computes in fp32; the result is not bit-identical to fp32 moments.
+OPTIMIZER_MOMENT_DTYPE="${OPTIMIZER_MOMENT_DTYPE:-bf16}"
 
 # ---- MTP speculative decoding ----
 # GLM-5.3 ships 1 native MTP layer. Megatron-Bridge's GLM5 bridge builds none unless mtp_num_layers=1 is
