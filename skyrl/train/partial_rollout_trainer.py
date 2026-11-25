@@ -21,7 +21,7 @@ inference engines stay full, each cut hits about ``num_parallel_generation_worke
 mean staleness is about one step higher. See ``_PartialRolloutAdmissionController``.
 
 Compared with the fully-async trainer, there is no GPU split and no generation during training. A
-mini-batch is at most a few cuts behind the current policy. Compared with the synchronous trainer,
+mini-batch is typically a few cuts behind the current policy. Compared with the synchronous trainer,
 the step does not wait for the longest trajectory. Tokens generated before a cut carry the rollout
 logprobs of the older policy. The loss must use rollout logprobs, and ``FullyAsyncRayPPOTrainer``
 asserts this.
@@ -31,10 +31,11 @@ of the paused requests. ``false`` copies the KV cache to host memory during trai
 a request resumes with no prefill and continues from KV states of the older weights. ``true`` discards
 the KV cache, and the inference engine prefills the paused requests again with the new weights.
 
-The trainer sets no limit on the number of cuts that one group survives. The metric
-``partial_rollout/groups_cut`` reports the groups in flight at each cut. The metric ``async/staleness``
-is the age of a trained group in steps. The age also counts the steps that a finished group waited in
-the buffer.
+The trainer sets no limit on the number of cuts that one group survives, so it does not warn about
+or count groups older than ``max_staleness_steps`` (see ``_bounds_staleness``). The metric
+``partial_rollout/groups_cut`` reports the groups in flight at each cut. The metrics
+``async/staleness_*`` report the age of a trained group in steps, from the step that admitted it to the
+step that trains on it. The age also counts the steps that a finished group waited in the buffer.
 """
 
 from loguru import logger
@@ -143,6 +144,10 @@ class PartialRolloutRayPPOTrainer(FullyAsyncRayPPOTrainer):
         # sync wakes the engines and resumes the paused requests (`WorkerDispatch.save_weights_for_sampler`).
         offload_kv = not self.cfg.trainer.fully_async.clear_kv_cache_on_weight_sync
         await self.inference_engine_client.sleep_with_frozen_requests(offload_kv=offload_kv)
+
+    def _bounds_staleness(self) -> bool:
+        # A group survives any number of cuts, so `max_staleness_steps` does not bound its age.
+        return False
 
     def _checkpoint_before_weight_sync(self) -> bool:
         # The checkpoint loads the policy back to the GPUs. It must run while the inference engines

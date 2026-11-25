@@ -18,6 +18,7 @@ A subclass changes how generation and training share the GPUs through these hook
 - `_before_training_step`: runs after the mini-batch is collected and before training.
 - `_sync_weights_after_training_step`: pushes the new weights to the inference engines.
 - `_checkpoint_before_weight_sync`: whether the step's checkpoint runs before the weight sync instead of after eval.
+- `_bounds_staleness`: whether `max_staleness_steps` bounds the staleness of a trained group.
 - `_after_training_loop`: runs after the last epoch and before the final checkpoint.
 """
 
@@ -466,6 +467,15 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         so that the checkpoint runs while the engines sleep. The loop reads this hook once per step.
         In both positions the checkpoint has its own ``trainer.step_timeout_s`` budget."""
         return False
+
+    def _bounds_staleness(self) -> bool:
+        """Return whether ``max_staleness_steps`` bounds the staleness of a trained group.
+
+        The default is ``True``: the admission controller keeps a group within
+        ``max_staleness_steps``, so the loop warns about each trained group past it and logs
+        ``async/staleness_violation_count``. A subclass whose admission rule does not bound the
+        staleness returns ``False``, and the loop skips both."""
+        return True
 
     async def _sync_weights_after_training_step(self) -> None:
         """Push the new weights to the inference engines.
@@ -1151,6 +1161,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         uids = []
         stalenesses = []
         staleness_violation_count = 0
+        bounds_staleness = self._bounds_staleness()
         # Per-group completion times (seconds) and the intra-group spread (std and coefficient of
         # variation) of per-trajectory completion times. Helpful to understand tail latency
         group_completion_times: List[float] = []
@@ -1180,7 +1191,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             uids.extend([cur_generated_output_group.uid] * group_size)
 
             # Check staleness violation.
-            if cur_staleness > self.max_staleness_steps:
+            if bounds_staleness and cur_staleness > self.max_staleness_steps:
                 # TODO(Charlie): should we drop, drop and resample, or just log?
                 logger.warning(
                     "Staleness control violated despite using AsyncStalenessManager: "
@@ -1285,9 +1296,10 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 "async/staleness_max": max(stalenesses),
                 "async/staleness_min": min(stalenesses),
                 "async/staleness_ratio": sum(1 for s in stalenesses if s > 0) / len(stalenesses),
-                "async/staleness_violation_count": staleness_violation_count,
             }
         )
+        if bounds_staleness:
+            self.all_metrics["async/staleness_violation_count"] = staleness_violation_count
 
         # Per-token reward conversion (kept groups only) + reward metrics over the kept+dropped view.
         generator_output, uids = self.postprocess_generator_output(

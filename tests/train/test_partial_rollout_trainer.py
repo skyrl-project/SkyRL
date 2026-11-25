@@ -103,6 +103,13 @@ def test_buffer_size_follows_max_staleness_steps():
     assert trainer._gen_buffer_maxsize == max(3, trainer.mini_batch_size * 3)
 
 
+def test_does_not_bound_staleness():
+    """A group survives any number of cuts, so the loop must not warn about groups past max_staleness_steps."""
+    cfg = _partial_cfg()
+    cfg.trainer.fully_async.max_staleness_steps = 0
+    assert _partial_trainer(MagicMock(), cfg=cfg)._bounds_staleness() is False
+
+
 # ---------------------------------------------------------------------------
 # PartialRolloutRayPPOTrainer step order
 # ---------------------------------------------------------------------------
