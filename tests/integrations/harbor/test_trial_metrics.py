@@ -1,5 +1,7 @@
 """Harbor's per-attempt trial metrics, and the plain Harbor generator logging them without skycap."""
 
+import json
+import threading
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -14,6 +16,7 @@ from examples.train_integrations.harbor.entrypoints.main_harbor import (  # noqa
     HARBOR_DEFAULT_CONFIG,
 )
 from skyrl.integration.harbor import harbor_generator  # noqa: E402
+from skyrl.integration.harbor import trial_metrics as trial_metrics_module  # noqa: E402
 from skyrl.integration.harbor.harbor_generator import (  # noqa: E402
     HarborGenerator,
 )
@@ -23,6 +26,7 @@ from skyrl.integration.harbor.trial_metrics import (  # noqa: E402
     trial_metrics,
 )
 from skyrl.train.generators.base import TrajectoryID  # noqa: E402
+from skyrl.train.generators.utils import concatenate_generator_outputs  # noqa: E402
 
 pytestmark = pytest.mark.integrations
 
@@ -100,6 +104,95 @@ def test_a_healthy_step_charts_zero_failures() -> None:
             assert metrics[f"generate/harbor/{phase}_time_{stat}"] == pytest.approx(seconds)
 
 
+def agent_step(*calls: tuple[str, str]) -> dict:
+    """An ATIF agent step with one ``(function_name, output)`` tool call per pair, as Harbor writes Codex's."""
+    return {
+        "source": "agent",
+        "tool_calls": [{"tool_call_id": f"call_{i}", "function_name": name} for i, (name, _) in enumerate(calls)],
+        "observation": {
+            "results": [{"source_call_id": f"call_{i}", "content": out} for i, (_, out) in enumerate(calls)]
+        },
+    }
+
+
+REJECTED = ("apply_patch", "apply_patch verification failed: Failed to read file to update /app/solution.py")
+APPLIED = ("apply_patch", "Exit code: 0\nOutput:\nSuccess. Updated the following files:\nA /app/solution.py\n")
+SHELL = ("exec_command", "Exit code: 0\nOutput:\n5\n")
+CODEX = [{"source": "user", "message": "task"}, agent_step(REJECTED), agent_step(APPLIED, SHELL), agent_step()]
+TERMINUS = [{"source": "user", "message": "task"}, agent_step(SHELL)]
+
+
+def attempt_at(tmp_path, name: str, trajectory: Any) -> TrialAttempts:
+    """One recorded attempt whose trial directory holds ``trajectory`` (a step list, raw text, or None for no file)."""
+    trial_dir = tmp_path / name
+    (trial_dir / "agent").mkdir(parents=True)
+    if trajectory is not None:
+        text = trajectory if isinstance(trajectory, str) else json.dumps({"steps": trajectory})
+        (trial_dir / "agent" / "trajectory.json").write_text(text)
+    trial = TrialAttempts()
+    trial.start()
+    trial.record(SimpleNamespace(**vars(completed()), trial_uri=trial_dir.as_uri()))
+    return trial
+
+
+@pytest.mark.parametrize(
+    "trajectories, expected",
+    [
+        (
+            # A patch rejected, then applied with a shell call, then a turn without a call; an attempt that never
+            # called a tool; one with no trajectory and one whose trajectory doesn't parse, both left out.
+            [CODEX, [agent_step()], None, "{not json"],
+            {
+                "avg_agent_steps": 2.0,
+                "avg_tool_calls": 1.5,
+                "avg_attempts_without_tool_calls": 0.5,
+                "avg_patches_applied": 0.5,
+                "avg_patches_rejected": 0.5,
+                "avg_patch_success_rate": 0.5,
+            },
+        ),
+        # No apply_patch call (Terminus-2): no patch counts at all.
+        ([TERMINUS], {"avg_agent_steps": 1.0, "avg_tool_calls": 1.0, "avg_attempts_without_tool_calls": 0.0}),
+        # Nothing readable: no tool metrics.
+        ([None], {}),
+    ],
+    ids=["codex", "no apply_patch", "no trajectory"],
+)
+def test_tool_use_is_counted_from_each_attempts_agent_trajectory(tmp_path, trajectories, expected) -> None:
+    trials = [attempt_at(tmp_path, f"trial_{i}", t) for i, t in enumerate(trajectories)]
+    metrics = trial_metrics(trials)
+    tool_keys = {k for k in metrics if k.startswith("generate/harbor/avg_")}
+    assert tool_keys == {f"generate/harbor/{k}" for k in expected}
+    for key, value in expected.items():
+        assert metrics[f"generate/harbor/{key}"] == pytest.approx(value)
+
+
+def test_tool_metrics_are_averaged_when_generator_outputs_are_concatenated(tmp_path) -> None:
+    """Fully async training concatenates one generator output per prompt group, and eval one per batch:
+    every tool metric of the combined output is the mean of the outputs', never their sum."""
+    no_tool_keys = trial_metrics([attempt_at(tmp_path, "no_trajectory", None)])
+    first = trial_metrics([attempt_at(tmp_path, "codex", CODEX)])
+    second = trial_metrics(
+        [attempt_at(tmp_path, "applied", [agent_step(APPLIED)]), attempt_at(tmp_path, "silent", [agent_step()])]
+    )
+    output = {
+        "prompt_token_ids": [[1]],
+        "response_ids": [[1, 2]],
+        "rewards": [1.0],
+        "loss_masks": [[1, 1]],
+        "stop_reasons": ["stop"],
+        "rollout_logprobs": None,
+    }
+    merged = concatenate_generator_outputs(
+        [{**output, "rollout_metrics": first}, {**output, "rollout_metrics": second}]
+    )["rollout_metrics"]
+
+    tool_keys = set(first) - set(no_tool_keys)
+    assert tool_keys == set(second) - set(no_tool_keys) and len(tool_keys) == 6
+    for key in tool_keys:
+        assert merged[key] == pytest.approx((first[key] + second[key]) / 2), key
+
+
 class FakeTrial:
     """Replaces Harbor's ``Trial``: each task path's attempts return its results in turn."""
 
@@ -116,12 +209,9 @@ class FakeTrial:
         return self.scripts[self.path].pop(0)
 
 
-@pytest.mark.asyncio
-async def test_the_plain_harbor_generator_logs_a_start_timeout_rescued_by_a_retry(monkeypatch) -> None:
-    FakeTrial.scripts = {
-        "slow_start": [result("EnvironmentStartTimeoutError", environment_setup=timing(0, START_TIMEOUT)), completed()],
-        "linear": [completed()],
-    }
+def plain_generator(monkeypatch, scripts: dict) -> HarborGenerator:
+    """The plain Harbor generator on ``FakeTrial``, each task path's attempts returning ``scripts[path]`` in turn."""
+    FakeTrial.scripts = scripts
     monkeypatch.setattr(harbor_generator, "Trial", FakeTrial)
 
     async def finish_session(session_id: str) -> None:
@@ -134,12 +224,39 @@ async def test_the_plain_harbor_generator_logs_a_start_timeout_rescued_by_a_retr
             "step_wise_trajectories": True,
             "merge_stepwise_output": True,
             "apply_overlong_filtering": False,
+            "timeout_mask_instance_fraction": 0.25,
             "rate_limit": None,
         }
     )
     with open(HARBOR_DEFAULT_CONFIG) as f:
         harbor_cfg = yaml.safe_load(f)
-    generator = HarborGenerator(cfg, harbor_cfg, client, tokenizer=None, max_seq_len=1024)
+    return HarborGenerator(cfg, harbor_cfg, client, tokenizer=None, max_seq_len=1024)
+
+
+@pytest.mark.asyncio
+async def test_the_plain_harbor_generator_reads_trajectories_off_its_event_loop(monkeypatch) -> None:
+    read_on = []
+    monkeypatch.setattr(trial_metrics_module, "read_tool_use", lambda trial_uri: read_on.append(threading.get_ident()))
+    generator = plain_generator(monkeypatch, {"linear": [completed()]})
+    await generator.generate(
+        {"prompts": ["linear"], "trajectory_ids": [TrajectoryID(instance_id="linear", repetition_id=0)]},
+        disable_tqdm=True,
+    )
+    assert read_on and threading.get_ident() not in read_on
+
+
+@pytest.mark.asyncio
+async def test_the_plain_harbor_generator_logs_a_start_timeout_rescued_by_a_retry(monkeypatch) -> None:
+    generator = plain_generator(
+        monkeypatch,
+        {
+            "slow_start": [
+                result("EnvironmentStartTimeoutError", environment_setup=timing(0, START_TIMEOUT)),
+                completed(),
+            ],
+            "linear": [completed()],
+        },
+    )
 
     out = await generator.generate(
         {
