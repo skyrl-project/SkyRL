@@ -32,7 +32,7 @@ from skyrl.backends.skyrl_train.patches.vllm import (  # noqa: E402
 )
 from skyrl.backends.skyrl_train.weight_sync.sharded_rdt.sharded_rdt_engine import (  # noqa: E402
     SkyRLShardedRDTWeightTransferEngine,
-    _split_modules,
+    _partly_shared_modules,
     _unshared_submodules,
 )
 
@@ -144,7 +144,7 @@ class _MlaAttention(torch.nn.Module, AttentionLayerBase):
         self.W_UV = self.kv_b_proj.weight.detach().to(act_dtype).T.clone()
 
 
-class _DraftWithSplitAttention(_Draft):
+class _DraftWithPartlySharedAttention(_Draft):
     """A drafter whose attention layer holds a module of the target, as DeepSeek-V3.2's MTP block does."""
 
     def __init__(self, target):
@@ -248,57 +248,63 @@ def test_bake_accepts_a_drafter_module_with_only_kv_cache_scales():
     engine._bake(init_info)
 
 
-def test_split_modules_finds_the_attention_layer_unshared_holds_only_in_parts():
+def test_partly_shared_modules_finds_the_attention_layer_unshared_holds_only_in_parts():
     target = _TargetWithRope()
-    draft = _DraftWithSplitAttention(target)
+    draft = _DraftWithPartlySharedAttention(target)
     layer = draft.layers["2"]
     unshared = _unshared_submodules(draft, target)
     assert layer.self_attn.kv_b_proj in list(unshared) and layer.self_attn not in list(unshared)
-    # The containers above a shared module are split too; only the attention layer needs a rebuild.
-    assert _split_modules(draft, target, unshared) == [draft, draft.layers, layer, layer.shared_head, layer.self_attn]
+    # The containers above a shared module are partly shared too; only the attention layer needs a rebuild.
+    assert _partly_shared_modules(draft, target, unshared) == [
+        draft,
+        draft.layers,
+        layer,
+        layer.shared_head,
+        layer.self_attn,
+    ]
 
 
-def test_split_modules_leaves_a_whole_attention_layer_to_the_finalize():
+def test_partly_shared_modules_leaves_a_whole_attention_layer_to_the_finalize():
     target = _TargetWithRope()
-    draft = _DraftWithSplitAttention(target)
+    draft = _DraftWithPartlySharedAttention(target)
     attn = draft.layers["2"].self_attn
     attn.rotary_emb = torch.nn.Identity()  # its own rope: the layer is in ``unshared`` as a whole
-    assert attn not in _split_modules(draft, target, _unshared_submodules(draft, target))
+    assert attn not in _partly_shared_modules(draft, target, _unshared_submodules(draft, target))
 
 
-SPLIT_NAMES = {**TARGET_NAMES, **DRAFT_NAMES, "layers.2.self_attn.kv_b_proj.weight": [4, 4]}
+PARTLY_SHARED_NAMES = {**TARGET_NAMES, **DRAFT_NAMES, "layers.2.self_attn.kv_b_proj.weight": [4, 4]}
 
 
-def test_bake_accepts_a_split_attention_layer_whose_params_are_all_in_its_children():
-    engine, _, draft, init_info = _engine(SPLIT_NAMES, _DraftWithSplitAttention, _TargetWithRope)
+def test_bake_accepts_a_partly_shared_attention_layer_whose_params_are_all_in_its_children():
+    engine, _, draft, init_info = _engine(PARTLY_SHARED_NAMES, _DraftWithPartlySharedAttention, _TargetWithRope)
     engine._bake(init_info)
     assert "layers.2.self_attn.kv_b_proj.weight" in engine._name_to_plan
 
 
-def test_bake_accepts_a_split_attention_layer_with_only_kv_cache_scales():
-    engine, _, draft, init_info = _engine(SPLIT_NAMES, _DraftWithSplitAttention, _TargetWithRope)
+def test_bake_accepts_a_partly_shared_attention_layer_with_only_kv_cache_scales():
+    engine, _, draft, init_info = _engine(PARTLY_SHARED_NAMES, _DraftWithPartlySharedAttention, _TargetWithRope)
     draft.layers["2"].self_attn.k_scale = torch.nn.Parameter(torch.tensor(-1.0), requires_grad=False)
     engine._bake(init_info)
 
 
-def test_bake_refuses_a_split_module_that_owns_params():
-    """No reload reaches a param that a split module owns itself, so it would keep its boot value."""
-    engine, _, draft, init_info = _engine(SPLIT_NAMES, _DraftWithSplitAttention, _TargetWithRope)
+def test_bake_refuses_a_partly_shared_module_that_owns_params():
+    """No reload reaches a param that a partly shared module owns itself, so it would keep its boot value."""
+    engine, _, draft, init_info = _engine(PARTLY_SHARED_NAMES, _DraftWithPartlySharedAttention, _TargetWithRope)
     draft.layers["2"].self_attn.gain = torch.nn.Parameter(torch.ones(4))
     with pytest.raises(RuntimeError, match=r"layers\.2\.self_attn.*does not reload"):
         engine._bake(init_info)
 
 
-def test_bake_refuses_a_split_module_with_a_quantization_method():
-    engine, _, draft, init_info = _engine(SPLIT_NAMES, _DraftWithSplitAttention, _TargetWithRope)
+def test_bake_refuses_a_partly_shared_module_with_a_quantization_method():
+    engine, _, draft, init_info = _engine(PARTLY_SHARED_NAMES, _DraftWithPartlySharedAttention, _TargetWithRope)
     draft.layers["2"].shared_head.quant_method = object()
     with pytest.raises(RuntimeError, match=r"layers\.2\.shared_head.*does not reload"):
         engine._bake(init_info)
 
 
-def test_finish_weight_update_rebuilds_what_a_split_attention_layer_derives_from_its_weights(monkeypatch):
+def test_finish_weight_update_rebuilds_what_a_partly_shared_attention_layer_derives_from_its_weights(monkeypatch):
     """The drafter's finalize walks ``unshared`` only, which holds the layer's ``kv_b_proj`` but not the layer."""
-    engine, target, draft, _ = _engine(TARGET_NAMES, _DraftWithSplitAttention, _TargetWithRope)
+    engine, target, draft, _ = _engine(TARGET_NAMES, _DraftWithPartlySharedAttention, _TargetWithRope)
     attn = draft.layers["2"].self_attn
     attn.process_weights_after_loading(torch.float32)
 

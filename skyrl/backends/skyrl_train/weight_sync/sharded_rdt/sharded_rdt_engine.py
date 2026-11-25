@@ -171,9 +171,9 @@ class _Drafter(NamedTuple):
     model: torch.nn.Module
     unshared: torch.nn.Module  # its modules not shared with the target, which bake, reload and finalize with it
     config: Any  # its model config
-    # Its modules that ``unshared`` holds only in parts (see ``_split_modules``). No reload or finalize
+    # Its modules that ``unshared`` holds only in parts (see ``_partly_shared_modules``). No reload or finalize
     # treats one as a layer, so the engine rebuilds what its attention layers derive from their weights.
-    split: list[torch.nn.Module]
+    partly_shared: list[torch.nn.Module]
 
 
 @dataclass
@@ -421,7 +421,7 @@ class SkyRLShardedRDTWeightTransferEngine(
         """
         unshared = _unshared_submodules(draft_model, self.model)
         self._draft = _Drafter(
-            draft_model, unshared, draft_model_config, _split_modules(draft_model, self.model, unshared)
+            draft_model, unshared, draft_model_config, _partly_shared_modules(draft_model, self.model, unshared)
         )
 
     def init_transfer_engine(self, init_info: SkyRLShardedRDTWeightTransferInitInfo) -> None:
@@ -718,9 +718,9 @@ class SkyRLShardedRDTWeightTransferEngine(
             finalize_layerwise_reload(self.model, self.model_config)
             if self._draft is not None:
                 finalize_layerwise_reload(self._draft.unshared, self._draft.config)
-                # The finalize above walks ``unshared`` only, so it never reaches a split attention layer.
+                # The finalize above walks ``unshared`` only, so it never reaches a partly shared attention layer.
                 # This is the call it makes on every attention layer it does reach.
-                for layer in self._draft.split:
+                for layer in self._draft.partly_shared:
                     if is_deferred_attention_layer(layer):
                         layer.process_weights_after_loading(self._draft.config.dtype)
             # A sleep for the sync (offload_kv_for_weight_sync) zeroes MoE kernel
@@ -960,16 +960,16 @@ class SkyRLShardedRDTWeightTransferEngine(
                     "would keep drafting with their boot weights. Train the policy's MTP head (trainer.mtp), and "
                     "share any module the target also loads."
                 )
-            # A split module is reloaded as its children only. Params it owns itself are never reloaded, and
-            # nothing runs the post-load step of its quantization method. An attention layer's derived tensors
-            # are the one case finish_weight_update rebuilds.
+            # A partly shared module is reloaded as its children only. Params it owns itself are never
+            # reloaded, and nothing runs the post-load step of its quantization method. An attention layer's
+            # derived tensors are the one case finish_weight_update rebuilds.
             from vllm.model_executor.layers.attention import (
                 is_deferred_attention_layer,
             )
 
             unsynced = [
                 path[m]
-                for m in self._draft.split
+                for m in self._draft.partly_shared
                 if any(n not in kv_scales for n, _ in m.named_parameters(recurse=False))
                 or (getattr(m, "quant_method", None) is not None and not is_deferred_attention_layer(m))
             ]
@@ -1648,7 +1648,9 @@ def _unshared_submodules(model: torch.nn.Module, other: torch.nn.Module) -> torc
     return torch.nn.ModuleList(pick(model))
 
 
-def _split_modules(model: torch.nn.Module, other: torch.nn.Module, unshared: torch.nn.Module) -> list[torch.nn.Module]:
+def _partly_shared_modules(
+    model: torch.nn.Module, other: torch.nn.Module, unshared: torch.nn.Module
+) -> list[torch.nn.Module]:
     """The modules of ``model`` that are neither in ``unshared`` nor modules of ``other``.
 
     Such a module holds a module of ``other`` somewhere below it, so ``unshared`` has only its clean
@@ -1656,7 +1658,7 @@ def _split_modules(model: torch.nn.Module, other: torch.nn.Module, unshared: tor
     containers (the drafter itself, its layer list). The one that matters is an attention layer: vLLM
     rebuilds what it derives from its weights (absorbed MLA's ``W_UK_T`` and ``W_UV``, out of ``kv_b_proj``)
     in its ``process_weights_after_loading``, which the finalize calls only on the attention layers it
-    walks. Any attention class that holds a rotary embedding itself is split this way, because
+    walks. Any attention class that holds a rotary embedding itself is partly shared this way, because
     ``get_rope`` caches one module per process and the target holds the same one. DeepSeek-V3.2's is one.
     """
     covered = {id(module) for module in unshared.modules()} | {id(module) for module in other.modules()}
