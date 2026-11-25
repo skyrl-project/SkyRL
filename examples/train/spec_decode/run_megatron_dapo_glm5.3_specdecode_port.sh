@@ -14,13 +14,22 @@ set -x
 #   16 prompts x 16 samples per step           | cpu_adamw_bf16         -> optimizer_offload_to_disk
 #   k=4 probabilistic drafts, hard-label loss  | TP1/CP16/PP3/EP16 DeepEP -> TP2/CP8/PP3/EP16 alltoall
 #   capture sizes up to max_num_seqs * (k+1)   | NVFP4 KV cache         -> bf16 KV cache
-#   sharded_rdt weight sync, top-k 128 / top-p 0.99
+#   top-k 128 / top-p 0.99                     | sharded_rdt sync       -> nccl sync (default)
 #
-# STATUS: ran on 8x8 B200. Step 2 of the MTP arm: policy_train ~160 s (disk optimizer ~64 s), step ~340 s,
-# 10.7 GiB free on the fullest trainer GPU. WEIGHT_SYNC_BACKEND=nccl works as is. The default sharded_rdt
-# needs two fixes that are not in this branch:
-#   1. Ray >= 2.58.0. Ray 2.57.0 segfaults at the first sync (set-before-register race, ray-project/ray#64558).
-#   2. A rebuild of the drafter's W_UK_T / W_UV after each sync. Without it the acceptance length is ~1.55.
+# STATUS: ran on 8x8 B200, 20 steps per arm, with WEIGHT_SYNC_BACKEND=sharded_rdt (means of steps 2-20):
+#
+#                       MTP off    MTP on    off / on
+#   step                400.4 s    295.7 s   1.35x
+#   rollout (generate)  206.3 s    107.8 s   1.91x
+#   policy_train        149.5 s    144.2 s   (disk optimizer step ~58 s of it)
+#   weight sync          15.4 s     15.5 s
+#
+# The acceptance length was 3.75. The fullest trainer GPU reached 168.5 GiB.
+#
+# The default sync backend is nccl, because it runs on the pinned Ray. Its sync took ~50 s in both arms
+# of an earlier run, which gives ~435 s vs ~331 s (~1.31x); this trainer layout did not run with nccl.
+# WEIGHT_SYNC_BACKEND=sharded_rdt needs Ray >= 2.58.0: Ray 2.57.0, the pinned version, segfaults at the
+# first sync (set-before-register race, ray-project/ray#64558). The script refuses that combination.
 #
 #   bash examples/train/algorithms/dapo/prepare_dapo_data.sh
 #   bash examples/train/spec_decode/run_megatron_dapo_glm5.3_specdecode_port.sh                    # MTP
@@ -46,8 +55,17 @@ INFERENCE_ENGINE_DATA_PARALLEL_SIZE="${INFERENCE_ENGINE_DATA_PARALLEL_SIZE:-1}"
 INFERENCE_ENGINE_EXPERT_PARALLEL_SIZE="${INFERENCE_ENGINE_EXPERT_PARALLEL_SIZE:-1}"
 # Engine-only nodes: no trainer shares the GPU, so 0.8 (the colocated runs needed 0.7).
 INFERENCE_ENGINE_GPU_MEMORY_UTILIZATION="${INFERENCE_ENGINE_GPU_MEMORY_UTILIZATION:-0.8}"
-# sharded_rdt is the backend PR 2762 adds the drafter sync to. nccl is the fallback.
-WEIGHT_SYNC_BACKEND="${WEIGHT_SYNC_BACKEND:-sharded_rdt}"
+# nccl runs on the pinned Ray. sharded_rdt (PR 2762 adds the drafter sync to it) is ~35 s faster per step.
+WEIGHT_SYNC_BACKEND="${WEIGHT_SYNC_BACKEND:-nccl}"
+if [ "$WEIGHT_SYNC_BACKEND" = "sharded_rdt" ] && [ "${ALLOW_OLD_RAY_SHARDED_RDT:-0}" != "1" ]; then
+  RAY_VERSION="$(${UV_RUN:-uv run --isolated} --extra megatron python -c 'import ray; print(ray.__version__)' | tail -n 1)"
+  if [ "$(printf '%s\n' 2.58.0 "$RAY_VERSION" | sort -V | head -n 1)" != "2.58.0" ]; then
+    echo "WEIGHT_SYNC_BACKEND=sharded_rdt needs Ray >= 2.58.0 (found $RAY_VERSION): Ray 2.57.0 segfaults at the" \
+      "first sync (ray-project/ray#64558). Use WEIGHT_SYNC_BACKEND=nccl, or set ALLOW_OLD_RAY_SHARDED_RDT=1 if" \
+      "your Ray carries the fix." >&2
+    exit 1
+  fi
+fi
 # sharded_rdt needs vLLM's Ray executor (the engine refuses mp at init); nccl runs on mp.
 if [ "$WEIGHT_SYNC_BACKEND" = "sharded_rdt" ]; then
   INFERENCE_EXECUTOR_BACKEND="${INFERENCE_EXECUTOR_BACKEND:-ray}"
