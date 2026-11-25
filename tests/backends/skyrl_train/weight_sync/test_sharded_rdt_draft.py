@@ -13,6 +13,9 @@ import torch
 
 pytest.importorskip("vllm")
 
+from vllm.model_executor.layers.attention_layer_base import (  # noqa: E402
+    AttentionLayerBase,
+)
 from vllm.model_executor.model_loader import reload  # noqa: E402
 from vllm.model_executor.model_loader.reload import (  # noqa: E402
     record_metadata_for_reloading,
@@ -29,6 +32,7 @@ from skyrl.backends.skyrl_train.patches.vllm import (  # noqa: E402
 )
 from skyrl.backends.skyrl_train.weight_sync.sharded_rdt.sharded_rdt_engine import (  # noqa: E402
     SkyRLShardedRDTWeightTransferEngine,
+    _partly_shared_modules,
     _unshared_submodules,
 )
 
@@ -113,6 +117,41 @@ class _DraftSharingNothing(_Draft):
         self.layers["2"].shared_head.head = torch.nn.Linear(4, 8, bias=False)
 
 
+class _TargetWithRope(_Target):
+    """A target whose layers hold the rotary embedding vLLM's ``get_rope`` caches once per process."""
+
+    def __init__(self):
+        super().__init__()
+        self.rotary_emb = torch.nn.Identity()
+
+
+class _MlaAttention(torch.nn.Module, AttentionLayerBase):
+    """Absorbed MLA, reduced: ``W_UV`` is derived from ``kv_b_proj`` after loading; the rope is the target's."""
+
+    def __init__(self, rotary_emb):
+        super().__init__()
+        self.kv_b_proj = torch.nn.Linear(4, 4, bias=False)
+        self.rotary_emb = rotary_emb
+        self.W_UV = None
+
+    def get_attn_backend(self):
+        raise NotImplementedError
+
+    def get_kv_cache_spec(self, vllm_config):
+        return None
+
+    def process_weights_after_loading(self, act_dtype):
+        self.W_UV = self.kv_b_proj.weight.detach().to(act_dtype).T.clone()
+
+
+class _DraftWithPartlySharedAttention(_Draft):
+    """A drafter whose attention layer holds a module of the target, as DeepSeek-V3.2's MTP block does."""
+
+    def __init__(self, target):
+        super().__init__(target)
+        self.layers["2"].self_attn = _MlaAttention(target.rotary_emb)
+
+
 TARGET_NAMES = {"embed_tokens.weight": [8, 4], "lm_head.weight": [8, 4]}
 DRAFT_NAMES = {
     "layers.2.eh_proj.weight": [4, 8],
@@ -121,8 +160,8 @@ DRAFT_NAMES = {
 }
 
 
-def _engine(names, draft_cls=_Draft):
-    target = _Target()
+def _engine(names, draft_cls=_Draft, target_cls=_Target):
+    target = target_cls()
     draft = draft_cls(target)
     record_metadata_for_reloading(target)
     record_metadata_for_reloading(draft)
@@ -207,6 +246,81 @@ def test_bake_refuses_any_unloaded_module_of_a_drafter_that_shares_nothing():
 def test_bake_accepts_a_drafter_module_with_only_kv_cache_scales():
     engine, _, _, init_info = _engine({**TARGET_NAMES, **DRAFT_NAMES}, draft_cls=_DraftWithKvScales)
     engine._bake(init_info)
+
+
+def test_partly_shared_modules_finds_the_attention_layer_unshared_holds_only_in_parts():
+    target = _TargetWithRope()
+    draft = _DraftWithPartlySharedAttention(target)
+    layer = draft.layers["2"]
+    unshared = _unshared_submodules(draft, target)
+    assert layer.self_attn.kv_b_proj in list(unshared) and layer.self_attn not in list(unshared)
+    # The containers above a shared module are partly shared too; only the attention layer needs a rebuild.
+    assert _partly_shared_modules(draft, target, unshared) == [
+        draft,
+        draft.layers,
+        layer,
+        layer.shared_head,
+        layer.self_attn,
+    ]
+
+
+def test_partly_shared_modules_leaves_a_whole_attention_layer_to_the_finalize():
+    target = _TargetWithRope()
+    draft = _DraftWithPartlySharedAttention(target)
+    attn = draft.layers["2"].self_attn
+    attn.rotary_emb = torch.nn.Identity()  # its own rope: the layer is in ``unshared`` as a whole
+    assert attn not in _partly_shared_modules(draft, target, _unshared_submodules(draft, target))
+
+
+PARTLY_SHARED_NAMES = {**TARGET_NAMES, **DRAFT_NAMES, "layers.2.self_attn.kv_b_proj.weight": [4, 4]}
+
+
+def test_bake_accepts_a_partly_shared_attention_layer_whose_params_are_all_in_its_children():
+    engine, _, draft, init_info = _engine(PARTLY_SHARED_NAMES, _DraftWithPartlySharedAttention, _TargetWithRope)
+    engine._bake(init_info)
+    assert "layers.2.self_attn.kv_b_proj.weight" in engine._name_to_plan
+
+
+def test_bake_accepts_a_partly_shared_attention_layer_with_only_kv_cache_scales():
+    engine, _, draft, init_info = _engine(PARTLY_SHARED_NAMES, _DraftWithPartlySharedAttention, _TargetWithRope)
+    draft.layers["2"].self_attn.k_scale = torch.nn.Parameter(torch.tensor(-1.0), requires_grad=False)
+    engine._bake(init_info)
+
+
+def test_bake_refuses_a_partly_shared_module_that_owns_params():
+    """No reload reaches a param that a partly shared module owns itself, so it would keep its boot value."""
+    engine, _, draft, init_info = _engine(PARTLY_SHARED_NAMES, _DraftWithPartlySharedAttention, _TargetWithRope)
+    draft.layers["2"].self_attn.gain = torch.nn.Parameter(torch.ones(4))
+    with pytest.raises(RuntimeError, match=r"layers\.2\.self_attn.*does not reload"):
+        engine._bake(init_info)
+
+
+def test_bake_refuses_a_partly_shared_module_with_a_quantization_method():
+    engine, _, draft, init_info = _engine(PARTLY_SHARED_NAMES, _DraftWithPartlySharedAttention, _TargetWithRope)
+    draft.layers["2"].shared_head.quant_method = object()
+    with pytest.raises(RuntimeError, match=r"layers\.2\.shared_head.*does not reload"):
+        engine._bake(init_info)
+
+
+def test_finish_weight_update_rebuilds_what_a_partly_shared_attention_layer_derives_from_its_weights(monkeypatch):
+    """The drafter's finalize walks ``unshared`` only, which holds the layer's ``kv_b_proj`` but not the layer."""
+    engine, target, draft, _ = _engine(TARGET_NAMES, _DraftWithPartlySharedAttention, _TargetWithRope)
+    attn = draft.layers["2"].self_attn
+    attn.process_weights_after_loading(torch.float32)
+
+    def finalize(model, model_config):  # the sync lands new weights before the derived tensors are rebuilt
+        if model is not target:
+            with torch.no_grad():
+                attn.kv_b_proj.weight.add_(1.0)
+
+    monkeypatch.setattr(reload, "finalize_layerwise_reload", finalize)
+    monkeypatch.setattr(patch_moe_kernel_constants, "restore_moe_kernel_constants", lambda model: None)
+    engine.model_config, engine._draft = None, engine._draft._replace(config=SimpleNamespace(dtype=torch.float32))
+    engine.drain_pending = lambda: None
+
+    engine.finish_weight_update()
+
+    assert torch.equal(attn.W_UV, attn.kv_b_proj.weight.T)
 
 
 def _worker(engine, draft):

@@ -580,6 +580,12 @@ sessions**: the main model, then the drafter. `sharded_rdt` is the exception (be
   `skyrl_set_draft_model`); the bake gives the
   names the target's `load_weights` skipped to the drafter's, and the drafter's own modules
   reload and finalize alongside the target's.
+  A drafter module that holds a module of the target (a "partly shared" module) reloads as its clean
+  children only. An attention layer that holds a rotary embedding itself is partly shared, because
+  `get_rope` caches one module per process. `finish_weight_update` calls
+  `process_weights_after_loading` on each partly shared attention layer, as vLLM's finalize does on a
+  whole one; without it absorbed MLA keeps stale `W_UK_T` / `W_UV`. The bake refuses a partly shared
+  module that owns params (other than KV-cache scales) or a quantization method.
 
 The draft source is `MegatronPolicyWorkerBase._build_draft_weight_source`: a
 `MegatronWeightSource` filtered to the MTP block plus the embedding and output layer. The
