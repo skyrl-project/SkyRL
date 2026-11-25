@@ -446,7 +446,12 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             "mini_batch_size <= num_parallel_generation_workers <= mini_batch_size * (max_staleness_steps + 1). Got: "
             f"{self.mini_batch_size=}, {self.num_parallel_generation_workers=}, {self.max_staleness_steps=}"
         )
-        assert not self.colocate_all, "colocate_all is not supported for async training yet."
+        assert not self.colocate_all, (
+            "FullyAsyncRayPPOTrainer does not support trainer.placement.colocate_all=true: it overlaps "
+            "generation with training on separate GPUs. With colocated inference engines, use "
+            "PartialRolloutRayPPOTrainer (skyrl/train/partial_rollout_trainer.py); "
+            "examples/train/fully_async/main_fully_async.py selects it when colocate_all=true."
+        )
 
     async def _before_training_step(self) -> None:
         """Run after the mini-batch is collected and before the forward and backward passes.
