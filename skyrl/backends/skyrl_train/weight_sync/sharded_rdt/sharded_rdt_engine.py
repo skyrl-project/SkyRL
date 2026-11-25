@@ -171,6 +171,9 @@ class _Drafter(NamedTuple):
     model: torch.nn.Module
     unshared: torch.nn.Module  # its modules not shared with the target, which bake, reload and finalize with it
     config: Any  # its model config
+    # Its attention layers that ``unshared`` holds only in parts, so no finalize rebuilds what they derive
+    # from their weights (see ``_split_attention_layers``).
+    split_attention: list[torch.nn.Module]
 
 
 @dataclass
@@ -416,7 +419,9 @@ class SkyRLShardedRDTWeightTransferEngine(
         engine load. Only the drafter's own modules are reloaded: the embedding and LM head it shares
         with the target already reload with the target.
         """
-        self._draft = _Drafter(draft_model, _unshared_submodules(draft_model, self.model), draft_model_config)
+        unshared = _unshared_submodules(draft_model, self.model)
+        split_attention = _split_attention_layers(draft_model, self.model, unshared)
+        self._draft = _Drafter(draft_model, unshared, draft_model_config, split_attention)
 
     def init_transfer_engine(self, init_info: SkyRLShardedRDTWeightTransferInitInfo) -> None:
         """Resolve producers and run the one-time bake.
@@ -711,6 +716,9 @@ class SkyRLShardedRDTWeightTransferEngine(
             finalize_layerwise_reload(self.model, self.model_config)
             if self._draft is not None:
                 finalize_layerwise_reload(self._draft.unshared, self._draft.config)
+                # The finalize above walks ``unshared`` only, so it never reaches these layers.
+                for layer in self._draft.split_attention:
+                    layer.process_weights_after_loading(self._draft.config.dtype)
             # A sleep for the sync (offload_kv_for_weight_sync) zeroes MoE kernel
             # constants that no reload rebuilds.
             restore_moe_kernel_constants(self.model)
@@ -1615,6 +1623,24 @@ def _unshared_submodules(model: torch.nn.Module, other: torch.nn.Module) -> torc
         return [m for child in module.children() for m in pick(child)]
 
     return torch.nn.ModuleList(pick(model))
+
+
+def _split_attention_layers(
+    model: torch.nn.Module, other: torch.nn.Module, unshared: torch.nn.Module
+) -> list[torch.nn.Module]:
+    """The attention layers of ``model`` that are neither in ``unshared`` nor modules of ``other``.
+
+    vLLM rebuilds what an attention layer derives from its weights (absorbed MLA's ``W_UK_T`` and ``W_UV``,
+    out of ``kv_b_proj``) in the layer's ``process_weights_after_loading``, which
+    ``finalize_layerwise_reload`` calls on the attention layers it walks. A drafter's attention layer
+    that holds a module of the target is in ``unshared`` only as its clean children: DeepSeek-V3.2's
+    holds the rotary embeddings ``get_rope`` caches per process. Its weights reload, and nothing
+    rebuilds the derived tensors.
+    """
+    from vllm.model_executor.layers.attention import is_deferred_attention_layer
+
+    covered = {id(module) for module in unshared.modules()} | {id(module) for module in other.modules()}
+    return [m for m in model.modules() if is_deferred_attention_layer(m) and id(m) not in covered]
 
 
 def _plan_digest(keys_per_chunk: list) -> str:
