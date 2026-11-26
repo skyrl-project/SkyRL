@@ -79,6 +79,21 @@ def test_excluded_file_covers_every_cuda_package_of_the_megatron_lock(rocm_requi
     assert {"torch", "vllm", "transformer-engine"} <= set(dropped)
 
 
+def test_mamba_packages_are_built_in_the_image_at_the_versions_of_the_lock(rocm_requirements):
+    """The lock's CUDA wheels stay out, verify guards the ROCm builds, and the Dockerfile's tags follow the lock."""
+    import re
+
+    excluded = rocm_requirements.read_excluded(_REPO_ROOT / "docker" / "rocm-excluded-packages.txt")
+    for names in (excluded, rocm_requirements.PROTECTED):
+        assert {"causal-conv1d", "mamba-ssm"} <= {rocm_requirements.norm(name) for name in names}
+
+    dockerfile = (_REPO_ROOT / "docker" / "Dockerfile.rocm").read_text(encoding="utf-8")
+    lock = (_REPO_ROOT / "uv.lock").read_text(encoding="utf-8")
+    for package, arg in (("causal-conv1d", "CAUSAL_CONV1D_TAG"), ("mamba-ssm", "MAMBA_TAG")):
+        locked = re.search(rf'^name = "{package}"\nversion = "([^"+]+)', lock, re.MULTILINE).group(1)
+        assert re.search(rf"^ARG {arg}=v(\S+)$", dockerfile, re.MULTILINE).group(1) == locked
+
+
 def test_git_pins_reads_name_and_commit(rocm_requirements):
     pins = rocm_requirements.git_pins(
         [

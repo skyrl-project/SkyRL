@@ -11,7 +11,8 @@ triton
 vllm
 flash-attn
 
-# CUDA-only kernels and transports. TransformerEngine is replaced by AMD's fork, built in the image
+# CUDA-only kernels and transports. TransformerEngine is replaced by AMD's fork, and causal-conv1d and
+# mamba-ssm by builds of their own sources for ROCm; all three are built in the image (docker/Dockerfile.rocm)
 causal-conv1d
 mamba-ssm
 flash-mla

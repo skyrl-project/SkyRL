@@ -1,8 +1,9 @@
 """Turn a ``uv export`` of SkyRL's lock into an install list for AMD ROCm, and check the result.
 
 SkyRL's lock resolves to CUDA wheels. A ROCm image takes the GPU-specific packages from its parent image
-(torch, vLLM, Triton, flash-attn) or builds them (TransformerEngine), and takes everything else from the
-lock at the pinned version. ``docker/Dockerfile.rocm`` uses the three commands below, in order.
+(torch, vLLM, Triton, flash-attn) or builds them (TransformerEngine, causal-conv1d, mamba-ssm), and takes
+everything else from the lock at the pinned version. ``docker/Dockerfile.rocm`` uses the three commands
+below, in order.
 
     python docker/rocm_requirements.py snapshot > protected.json
         Record the versions of the packages the parent image provides.
@@ -30,7 +31,18 @@ from typing import Optional
 KEEP = {"nvidia-resiliency-ext", "nvidia-modelopt", "nvidia-ml-py"}
 ALARM = re.compile(r"^(nvidia-|cuda-|flashinfer|nixl)|-cu1[23]$")
 # Provided by the parent image or built in the image; the lock's packages must not replace them.
-PROTECTED = ("torch", "torchvision", "torchaudio", "triton", "vllm", "flash-attn", "transformer_engine", "rocm")
+PROTECTED = (
+    "torch",
+    "torchvision",
+    "torchaudio",
+    "triton",
+    "vllm",
+    "flash-attn",
+    "transformer_engine",
+    "rocm",
+    "causal-conv1d",
+    "mamba-ssm",
+)
 
 
 def norm(name: str) -> str:
