@@ -23,6 +23,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
+from functools import cached_property
 
 import pytest
 import torch
@@ -35,7 +36,13 @@ pytest.importorskip("vllm", reason="the SkyRL sharded_rdt trainer imports vllm a
 pytestmark = pytest.mark.vllm
 
 import skyrl.backends.skyrl_train.weight_sync.sharded_rdt.sharded_rdt_trainer as trainer_mod  # noqa: E402
+from skyrl.backends.skyrl_train.weight_sync.sharded_rdt.sharded_rdt_base import (  # noqa: E402
+    GroupedWeightSource,
+    ParamMeta,
+    layerwise_groups,
+)
 from skyrl.backends.skyrl_train.weight_sync.sharded_rdt.sharded_rdt_common import (  # noqa: E402
+    TrainerCopy,
     buffer_alloc_bytes,
 )
 from skyrl.backends.skyrl_train.weight_sync.sharded_rdt.sharded_rdt_trainer import (  # noqa: E402
@@ -1114,3 +1121,152 @@ class TestSharedReservation:
         server.reserve_serve_buffer(2, 1024, None)
 
         assert list(server._serve_rings) == [0]
+
+
+class TestLaneShareGroups:
+    """With a lane table, sharers are copies of one worker WITHIN a lane
+    (deployment ``d`` in lane ``d % num_lanes``)."""
+
+    def test_a_lane_rendezvouses_without_the_other_lanes(self, sharing_server):
+        # 4 deployments x 2 workers, 2 lanes: worker 0 of deployments 0 and 2
+        # (consumers 0, 4) share; deployments 1 and 3 never arrive here.
+        server = sharing_server(workers_per_replica=2, num_consumers=8, producer_lane=[0, 1], stall_timeout_s=30.0)
+        server.reserve_serve_buffer(0, 64)
+        server.begin_sync(8, list(range(8)))
+        _publish(server, GI_A, GROUP_A)
+        specs = [(GROUP_A[0], ())]
+
+        assert server._sharers_of(server._share_group(0)) == frozenset({0, 4})
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            futures = [ex.submit(server.rdt_produce_weights_batched, specs, c, 0) for c in (0, 4)]
+            blobs = [f.result(timeout=10)[0] for f in futures]
+        assert blobs[0].data_ptr() == blobs[1].data_ptr()
+
+    def test_each_lane_reserves_its_own_ring(self, sharing_server):
+        server = sharing_server(workers_per_replica=2, num_consumers=8, producer_lane=[0, 1])
+        for consumer_id in (0, 2, 4, 6):
+            server.reserve_serve_buffer(consumer_id, 1024, "plan-a")
+        assert sorted(server._serve_rings) == [0, 2]
+
+    def test_no_table_is_the_original_grouping(self, sharing_server):
+        server = sharing_server(workers_per_replica=2, num_consumers=8)
+        server.begin_sync(8, list(range(8)))
+        assert server._sharers_of(server._share_group(0)) == frozenset({0, 2, 4, 6})
+
+
+class _CopySource(GroupedWeightSource):
+    """One layer group: a replicated name, and one expert per EP rank (EP2)."""
+
+    NAMES = ("model.layers.0.w", "model.layers.0.mlp.experts.0.w", "model.layers.0.mlp.experts.1.w")
+
+    def __init__(self, held, copy):
+        self._held = held
+        self._copy = copy
+
+    @cached_property
+    def metadata(self):
+        return [ParamMeta(n, torch.bfloat16, (2,)) for n in self.NAMES]
+
+    def iter_full(self):
+        yield from ()
+
+    def held_names(self):
+        return self._held
+
+    def trainer_copy(self):
+        return self._copy
+
+
+def _resolve_fleet(holdings, copies, *, num_consumers=32, workers_per_replica=8):
+    """Run ``_resolve_ownership`` on every rank of a fake fleet. A first pass
+    records each rank's all-gather contribution; the second replays them all."""
+    engines = []
+    for rank, (held, copy) in enumerate(zip(holdings, copies)):
+        e = SkyRLShardedRDTTrainerWeightTransferEngine(
+            client=None,
+            source=_CopySource(held, copy),
+            is_sender=rank == 0,
+            init_info=SkyRLShardedRDTTrainerInitInfo(
+                rank=rank, num_consumers=num_consumers, workers_per_replica=workers_per_replica
+            ),
+        )
+        e._meta = list(e.source.metadata)
+        e._groups = layerwise_groups([m.name for m in e._meta])
+        engines.append(e)
+    mine: list = []
+
+    class _Recorded(Exception):
+        pass
+
+    def _record(world, m):
+        mine.append(m)
+        raise _Recorded
+
+    for e in engines:
+        e._all_gather_owned = _record
+        with pytest.raises(_Recorded):
+            e._resolve_ownership(1, 0)
+    for rank, e in enumerate(engines):
+        e._all_gather_owned = lambda world, m: list(mine)
+        e._resolve_ownership(len(engines), rank)
+    return engines
+
+
+class TestResolveLanes:
+    """The trainer ships ``producer_lane`` from the trainer copies gathered with
+    the ownership masks; every rank derives the same table."""
+
+    DENSE, E0, E1 = _CopySource.NAMES
+    # DP2 x EP2: ranks (dp, ep) = (0,0) (0,1) (1,0) (1,1).
+    HOLD = [[DENSE, E0], [DENSE, E1], [DENSE, E0], [DENSE, E1]]
+    DP2 = [TrainerCopy(0, 2), TrainerCopy(0, 2), TrainerCopy(1, 2), TrainerCopy(1, 2)]
+
+    def test_two_copies_ship_two_lanes(self):
+        engines = _resolve_fleet(self.HOLD, self.DP2, workers_per_replica=2)
+        assert {tuple(e._producer_lane) for e in engines} == {(0, 0, 1, 1)}
+
+    def test_one_copy_ships_lane_zero(self):
+        engines = _resolve_fleet(self.HOLD, [TrainerCopy(0, 1)] * 4, workers_per_replica=2)
+        assert {tuple(e._producer_lane) for e in engines} == {(0, 0, 0, 0)}
+
+    def test_sharing_off_ships_lane_zero(self):
+        engines = _resolve_fleet(self.HOLD, self.DP2, workers_per_replica=0)
+        assert {tuple(e._producer_lane) for e in engines} == {(0, 0, 0, 0)}
+
+    def test_a_copy_missing_a_name_raises(self):
+        # Copy 1 holds expert 0 twice and never expert 1.
+        hold = [[self.DENSE, self.E0], [self.DENSE, self.E1], [self.DENSE, self.E0], [self.DENSE, self.E0]]
+        with pytest.raises(ValueError, match=rf"trainer copies \[1\] of 2 do not hold '{self.E1}'"):
+            _resolve_fleet(hold, self.DP2, workers_per_replica=2)
+
+    def test_disagreeing_num_copies_raise(self):
+        copies = self.DP2[:3] + [TrainerCopy(1, 4)]
+        with pytest.raises(ValueError, match=r"num_copies: 2 on ranks \[0, 1, 2\]; 4 on ranks \[3\]"):
+            _resolve_fleet(self.HOLD, copies, workers_per_replica=2)
+
+    def test_engine_and_producer_derive_the_same_share_groups(self, sharing_server):
+        """The worker init info and the producer kwargs carry the same table, so
+        the router and every producer agree on S and on each share group."""
+        from skyrl.backends.skyrl_train.weight_sync.sharded_rdt.sharded_rdt_engine import (
+            SkyRLShardedRDTWeightTransferEngine,
+        )
+
+        num_consumers, wpr = 32, 2
+        engines = _resolve_fleet(self.HOLD, self.DP2, num_consumers=num_consumers, workers_per_replica=wpr)
+        info = engines[0]._build_worker_init_info([f"srv{r}" for r in range(4)])
+        assert info.producer_lane == [0, 0, 1, 1]
+        info.num_replicas = num_consumers // wpr
+
+        consumer = object.__new__(SkyRLShardedRDTWeightTransferEngine)
+        consumer._num_consumers_override = num_consumers
+        router = consumer._build_router(info)
+        assert router.num_lanes == 2
+
+        for e in engines:
+            kwargs = e._server_kwargs(sorted(e._held_names or []))
+            kwargs.pop("served_names")
+            server = sharing_server(**kwargs)
+            assert server._num_lanes == router.num_lanes
+            assert [server._share_group(c) for c in range(num_consumers)] == [
+                router.share_group(c) for c in range(num_consumers)
+            ]

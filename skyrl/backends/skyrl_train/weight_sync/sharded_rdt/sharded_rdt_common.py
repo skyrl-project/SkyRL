@@ -9,8 +9,8 @@ The gather-group partition itself is ``base.layerwise_groups``: it defines what 
 group index means for any ``WeightSource``, not just this transport.
 """
 
-from collections.abc import Callable
-from typing import Any
+from collections.abc import Callable, Sequence
+from typing import Any, NamedTuple
 
 import torch
 
@@ -87,6 +87,141 @@ def assign_producer_indices(num_producers: int, num_consumers: int, consumer_idx
     return [consumer_idx * p // c]
 
 
+class TrainerCopy(NamedTuple):
+    """Where a trainer rank sits among the trainer's disjoint full model copies.
+
+    Lanes (``plan_producer_lanes``) are built from these: a producer's lane is
+    ``copy_rank % num_lanes``.
+    """
+
+    copy_rank: int
+    """Which copy this rank belongs to, in ``[0, num_copies)``. Shared by every
+    rank of that copy; together those ranks hold every name."""
+    num_copies: int
+    """Disjoint full copies across the trainer; the same on every rank. 1 means
+    unreplicated."""
+
+
+class LanePlan(NamedTuple):
+    """The trainer's lane assignment, shipped to the consumers and producers.
+
+    A lane pairs a subset of inference deployments with a subset of trainer
+    copies: deployment ``d`` pulls only from producers in lane
+    ``d % num_lanes``. Lanes spread the deployments' pulls over every copy
+    instead of all reading one.
+    """
+
+    producer_lane: list[int]
+    """Per producer rank, its lane; all 0 with one lane."""
+    num_copies: int
+    """Disjoint full model copies the trainer ranks reported."""
+    lane_cap: int
+    """Most lanes that keep ``workers_per_replica`` owners of every gather
+    group; 1 with slot sharing off."""
+
+
+def count_lanes(producer_lane: Sequence[int], num_consumers: int, workers_per_replica: int) -> int:
+    """Lanes in use: one per producer lane, at most one per deployment. The
+    router and the producer both derive the lane count here, from the same wire
+    data, so their share groups cannot disagree."""
+    consumers = max(1, num_consumers)
+    deployments = consumers // min(consumers, max(1, workers_per_replica or consumers))
+    return max(1, min(max(producer_lane, default=0) + 1, deployments))
+
+
+def share_group_of(consumer_id: int, workers_per_replica: int, num_lanes: int) -> int:
+    """The slot-sharing group of ``consumer_id``: its worker index within its
+    lane (deployment ``d`` is in lane ``d % num_lanes``).
+
+    Every consumer of one group routes every name to the same producer
+    (``RdtRouter.producer_for``), so their pulls are byte-identical. With
+    ``workers_per_replica <= 0`` nothing is shared: each consumer is its own
+    group.
+    """
+    if workers_per_replica <= 0:
+        return consumer_id
+    deployment, worker = divmod(consumer_id, workers_per_replica)
+    return worker + workers_per_replica * (deployment % max(1, num_lanes))
+
+
+def _check_copies(
+    names: Sequence[str],
+    name_owner_class: Sequence[int],
+    owner_sets: Sequence[Sequence[int]],
+    rank_copies: Sequence[TrainerCopy],
+) -> int:
+    """The ``num_copies`` every rank reports, once the copies are checked to be
+    disjoint and full: one count, ranks in range, every name held by every copy.
+
+    Raises:
+        ValueError: naming the disagreeing counts, the out-of-range copy rank,
+            or the first name some copy does not hold.
+    """
+    counts = sorted({c.num_copies for c in rank_copies})
+    if len(counts) > 1:
+        by_count = {n: [p for p, c in enumerate(rank_copies) if c.num_copies == n] for n in counts}
+        raise ValueError(
+            "trainer ranks disagree on num_copies: "
+            + "; ".join(f"{n} on ranks {ranks[:8]}" for n, ranks in by_count.items())
+        )
+    num_copies = counts[0]
+    bad = [(p, c.copy_rank) for p, c in enumerate(rank_copies) if not 0 <= c.copy_rank < num_copies]
+    if bad:
+        raise ValueError(f"copy_rank out of range [0, {num_copies}) (rank, copy_rank): {bad[:8]}")
+    copy_rank = [c.copy_rank for c in rank_copies]
+    first_name: dict[int, str] = {}
+    for n, oc in zip(names, name_owner_class):
+        first_name.setdefault(oc, n)
+    every = set(range(num_copies))
+    for oc, row in enumerate(owner_sets):
+        missing = sorted(every - {copy_rank[p] for p in row})
+        if missing:
+            raise ValueError(
+                f"trainer copies {missing} of {num_copies} do not hold {first_name[oc]!r} "
+                f"(owners {list(row)[:8]}, their copy ranks {sorted({copy_rank[p] for p in row})}). "
+                "GroupedWeightSource.trainer_copy() must partition the ranks into full model copies."
+            )
+    return num_copies
+
+
+def plan_producer_lanes(
+    names: Sequence[str],
+    name_owner_class: Sequence[int],
+    owner_sets: Sequence[Sequence[int]],
+    group_owners: Sequence[Sequence[int]],
+    rank_copies: Sequence[TrainerCopy],
+    workers_per_replica: int,
+) -> LanePlan:
+    """Assign each producer the lane its trainer copy serves.
+
+    Deployments in lane ``k`` read only from producers in lane ``k``, so a name
+    held once per trainer copy is served by every copy instead of one. The lane
+    count is capped so each lane still holds at least ``workers_per_replica``
+    owners of every group: a name every worker reads then keeps one producer
+    per worker, so no producer gains serve rings. Copies fold onto lanes by
+    ``copy_rank % num_lanes``, so every lane is a union of whole copies.
+
+    Args:
+        names: Every parameter name, in metadata order.
+        name_owner_class: Per name, its index into ``owner_sets``.
+        owner_sets: The distinct producer sets, as shipped to the consumers.
+        group_owners: Per gather group, every producer holding any of its names.
+        rank_copies: Per producer rank, its ``GroupedWeightSource.trainer_copy()``.
+        workers_per_replica: Consumers per inference deployment; 0 when slot
+            sharing is off, which leaves one lane.
+
+    Raises:
+        ValueError: the copies are not disjoint and full (``_check_copies``).
+    """
+    num_copies = _check_copies(names, name_owner_class, owner_sets, rank_copies)
+    if workers_per_replica <= 0:
+        cap = 1
+    else:
+        cap = min((len(g) // workers_per_replica for g in group_owners if g), default=num_copies)
+    num_lanes = max(1, min(num_copies, cap))
+    return LanePlan([c.copy_rank % num_lanes for c in rank_copies], num_copies, cap)
+
+
 class RdtRouter:
     """Decides which producer serves each weight name, and — once bound — sends.
 
@@ -118,11 +253,13 @@ class RdtRouter:
         names: list[str] | None = None,
         group_lens: list[int] | None = None,
         workers_per_replica: int = 0,
+        producer_lane: list[int] | None = None,
     ) -> None:
         """Build the routing tables from the wire data both engines receive.
 
-        The four table arguments travel together and default together: with all
-        of them empty the router degrades to "every producer holds everything".
+        The table arguments travel together and default together: with all of
+        them empty the router degrades to "every producer holds everything", in
+        one lane.
 
         Args:
             num_producers: Trainer ranks. Owner indices are positions in this
@@ -145,12 +282,16 @@ class RdtRouter:
                 carve spreads this many consumers over an owner set, and every
                 deployment reuses the same carve — see ``producer_for``. 0 (the
                 default) means one deployment, i.e. carve over the whole fleet.
+            producer_lane: Per producer, its lane (``plan_producer_lanes``).
+                Deployment ``d`` reads only from the owners in lane
+                ``d % num_lanes``. None puts every producer in lane 0.
 
         Raises:
             ValueError: ``workers_per_replica`` does not divide
                 ``num_consumers``, so the deployments cannot be uniform and the
                 overlay would map two workers of one deployment onto the same
-                block index.
+                block index; or ``producer_lane`` is not one entry per
+                producer.
         """
         self.num_producers = max(1, num_producers)
         self.num_consumers = max(1, num_consumers)
@@ -164,6 +305,17 @@ class RdtRouter:
                 "per-deployment block carve to be well defined."
             )
         self._owner_sets = [sorted(set(row)) for row in owner_sets] if owner_sets else [list(range(self.num_producers))]
+        self._producer_lane = list(producer_lane) if producer_lane is not None else [0] * self.num_producers
+        if len(self._producer_lane) != self.num_producers:
+            raise ValueError(f"producer_lane has {len(self._producer_lane)} entries for {self.num_producers} producers")
+        self.num_lanes = count_lanes(self._producer_lane, self.num_consumers, self._block_consumers)
+        # owner class -> lane -> its owners in that lane. Out-of-range owners
+        # are left to validate().
+        lane_of = [lane % self.num_lanes for lane in self._producer_lane]
+        self._lane_owners = [
+            [[p for p in row if 0 <= p < self.num_producers and lane_of[p] == k] for k in range(self.num_lanes)]
+            for row in self._owner_sets
+        ]
         names = list(names or [])
         self.num_groups = len(group_lens) if group_lens else 0
         classes = list(name_owner_class or [])
@@ -234,19 +386,29 @@ class RdtRouter:
 
         With one deployment the width IS the fleet, so this is the historical
         rule unchanged.
+
+        Lanes are the other axis: deployment ``d`` carves over only the owners
+        in lane ``d % num_lanes``, so the deployments' pulls of a name spread
+        over the trainer copies holding it. Sharers (same ``share_group``) still
+        resolve the same producer. One lane is the rule above.
         """
-        own = self.owners(name)
-        if not own:
+        if not self.owners(name):
             raise ValueError(f"{name!r} has no owner")
-        block = assign_producer_indices(len(own), self._block_consumers, consumer_id % self._block_consumers)
+        deployment, worker = divmod(consumer_id, self._block_consumers)
+        own = self._lane_owners[self.class_of(name)][deployment % self.num_lanes]
+        block = assign_producer_indices(len(own), self._block_consumers, worker)
         return own[block[self._group_of.get(name, 0) % len(block)]]
+
+    def share_group(self, consumer_id: int) -> int:
+        """The slot-sharing group ``consumer_id`` routes as (``share_group_of``)."""
+        return share_group_of(consumer_id, self._block_consumers, self.num_lanes)
 
     def validate(self) -> None:
         """Check the ownership tables can be served.
 
         Raises:
-            ValueError: an owner set is empty or out of range, or a class index
-                does not resolve.
+            ValueError: an owner set is empty or out of range, an owner class
+                does not resolve, or a lane holds no owner of an owner set.
         """
         for c, row in enumerate(self._owner_sets):
             if not row:
@@ -254,6 +416,12 @@ class RdtRouter:
             bad = [p for p in row if not 0 <= p < self.num_producers]
             if bad:
                 raise ValueError(f"owner set {c} out of range: {bad}")
+            empty = [k for k, own in enumerate(self._lane_owners[c]) if not own]
+            if empty:
+                raise ValueError(
+                    f"lane(s) {empty} of {self.num_lanes} hold no owner of owner set {c} "
+                    f"({row[:8]}): producer_lane does not partition the producers into full copies"
+                )
         for name, c in self._class_of.items():
             if not 0 <= c < len(self._owner_sets):
                 raise ValueError(

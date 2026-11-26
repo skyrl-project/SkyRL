@@ -218,6 +218,12 @@ class SkyRLShardedRDTWeightTransferInitInfo(WeightTransferInitInfo):
     present and routes each chunk to that class's owner. Derived by the trainer
     from ``WeightSource.held_names()``."""
 
+    producer_lane: list[int] = field(default_factory=list)
+    """Per producer (index into ``trainer_actor_names``), its lane
+    (``sharded_rdt_common.plan_producer_lanes``), one entry per producer.
+    Deployment ``d`` reads from lane ``d % num_lanes``; the producers derive the
+    same lane count from the same table."""
+
     num_consumers: int = 0
     """Total consumer count across the fleet, for M:N routing. Authoritative when
     > 0; at 0 the engine infers it from ``parallel_config``, which is correct for
@@ -492,24 +498,7 @@ class SkyRLShardedRDTWeightTransferEngine(
             raise RuntimeError("Sharded RDT engine requires a trainer producer: set " "init_info.trainer_actor_names.")
 
         consumer_id = self._resolve_consumer_id(init_info)
-        name_owner_class = list(init_info.name_owner_class or [])
-        if name_owner_class and len(name_owner_class) != len(init_info.names):
-            raise RuntimeError(
-                f"Sharded RDT engine: {len(name_owner_class)} owner-class entries " f"for {len(init_info.names)} names."
-            )
-        router = RdtRouter(
-            len(producer_names),
-            self._num_consumers(),
-            list(init_info.owner_sets) or None,
-            name_owner_class or None,
-            list(init_info.names),
-            list(init_info.group_lens),
-            # Carve the block per deployment so every replica's worker w pulls
-            # each name from the same producer, which is what lets that producer
-            # serve all of them from one slot.
-            workers_per_replica=self._workers_per_replica(init_info),
-        )
-        router.validate()
+        router = self._build_router(init_info)
 
         # A fresh router per init, never appended to: every owner index is a
         # position in these lists, so a second init_transfer_engine must not
@@ -549,12 +538,37 @@ class SkyRLShardedRDTWeightTransferEngine(
         router.bind(actors, methods, consumer_id)
         self._router = router
         logger.info(
-            "Sharded RDT engine (consumer %d) bound to all %d producers " "(batched method %r, %d owner class(es))",
+            "Sharded RDT engine (consumer %d) bound to all %d producers "
+            "(batched method %r, %d owner class(es), %d lane(s))",
             consumer_id,
             len(producer_names),
             init_info.produce_method_name,
             len(init_info.owner_sets) or 1,
+            router.num_lanes,
         )
+
+    def _build_router(self, init_info: SkyRLShardedRDTWeightTransferInitInfo) -> RdtRouter:
+        """The validated, unbound router for this fleet's wire data."""
+        name_owner_class = list(init_info.name_owner_class or [])
+        if name_owner_class and len(name_owner_class) != len(init_info.names):
+            raise RuntimeError(
+                f"Sharded RDT engine: {len(name_owner_class)} owner-class entries " f"for {len(init_info.names)} names."
+            )
+        router = RdtRouter(
+            len(init_info.trainer_actor_names),
+            self._num_consumers(),
+            list(init_info.owner_sets) or None,
+            name_owner_class or None,
+            list(init_info.names),
+            list(init_info.group_lens),
+            # Carve the block per deployment so every replica's worker w pulls
+            # each name from the same producer, which is what lets that producer
+            # serve all of them from one slot.
+            workers_per_replica=self._workers_per_replica(init_info),
+            producer_lane=list(init_info.producer_lane),
+        )
+        router.validate()
+        return router
 
     def _workers_per_replica(self, init_info: SkyRLShardedRDTWeightTransferInitInfo) -> int:
         """Consumers per inference deployment, assuming a uniform fleet.

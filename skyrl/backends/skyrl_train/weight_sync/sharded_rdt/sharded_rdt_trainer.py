@@ -43,6 +43,7 @@ from skyrl.backends.skyrl_train.weight_sync.sharded_rdt.rdt_libfabric_shim impor
     ensure_ray_rdt_libfabric,
 )
 from skyrl.backends.skyrl_train.weight_sync.sharded_rdt.sharded_rdt_base import (
+    GroupedWeightSource,
     ParamMeta,
     TrainerInitInfo,
     TrainerWeightTransferEngine,
@@ -52,8 +53,12 @@ from skyrl.backends.skyrl_train.weight_sync.sharded_rdt.sharded_rdt_base import 
 )
 from skyrl.backends.skyrl_train.weight_sync.sharded_rdt.sharded_rdt_common import (
     ALLOWED_OPS,
+    TrainerCopy,
     buffer_alloc_bytes,
     check_ray_rdt_version,
+    count_lanes,
+    plan_producer_lanes,
+    share_group_of,
 )
 
 ensure_ray_rdt_libfabric()
@@ -99,9 +104,11 @@ PRODUCE_METHOD_NAME = "rdt_produce_weights_batched"
 # Cross-deployment serve-slot sharing.
 #
 # Consumers whose ids differ by a multiple of ``workers_per_replica`` are the
-# same worker of different inference deployments, so they share a baked plan and
-# pull byte-identical chunks. A serve ring each would cost one full ring per
-# deployment of the producer's GPU and repack the same bytes once per deployment.
+# same worker of different inference deployments. Within one lane
+# (``share_group_of``; each lane reads from its own trainer copies) they share a
+# baked plan and pull byte-identical chunks. A serve ring each would
+# cost one full ring per deployment of the producer's GPU and repack the same
+# bytes once per deployment.
 #
 # NIXL reads are one-sided, so R readers can read ONE registered slot; what the
 # producer cannot see is when a reader has FINISHED. The release edge is
@@ -171,9 +178,10 @@ class SkyRLShardedRDTTrainerInitInfo(TrainerInitInfo):
     """Consumers per inference DEPLOYMENT (``num_consumers // num_replicas``).
 
     Fixes the slot-sharing groups: consumers whose ids differ by a multiple of
-    this are the same worker of different deployments, so they bake identical
-    plans and pull byte-identical chunks, and ONE registered serve slot can
-    serve all of them. 0 disables sharing, and so does the single-deployment
+    this are the same worker of different deployments, so within a lane
+    (``share_group_of``) they bake identical plans and pull byte-identical
+    chunks, and ONE registered serve slot can serve all of them. 0 disables
+    sharing and leaves one lane, and so does the single-deployment
     value ``num_consumers``, which makes every group a singleton and the serve
     path identical to the unshared one.
     """
@@ -214,6 +222,8 @@ class _RDTProducerServer:
         served_names: list[str] | None = None,
         stall_timeout_s: float = DEFAULT_STALL_TIMEOUT_S,
         workers_per_replica: int = 0,
+        num_consumers: int = 0,
+        producer_lane: list[int] | None = None,
     ) -> None:
         import gc
 
@@ -267,6 +277,8 @@ class _RDTProducerServer:
         # ``_share_width`` = consumers per deployment; 0 means every group is a
         # singleton and this degenerates to the unshared serve path.
         self._share_width = max(0, int(workers_per_replica))
+        # Lanes, derived from the same wire data as the router's.
+        self._num_lanes = count_lanes(producer_lane or [], num_consumers, self._share_width)
         self._consumer_ids: set[int] | None = None
         self._sharing_active = False
         self._sharers: dict[int, frozenset] = {}  # group -> members
@@ -573,10 +585,11 @@ class _RDTProducerServer:
                     rings[i] = self._new_serve_buffer(alloc)
 
     def _share_group(self, consumer_id: int) -> int:
-        """The slot-sharing group ``consumer_id`` belongs to: its index within
-        its own deployment, since that is what fixes the plan. Without a width
-        the group is the consumer itself and nothing is shared."""
-        return consumer_id % self._share_width if self._share_width > 0 else consumer_id
+        """The slot-sharing group ``consumer_id`` belongs to: its worker index
+        within its lane, since that is what fixes the plan (the
+        router's ``share_group``). Without a width the group is the consumer
+        itself and nothing is shared."""
+        return share_group_of(consumer_id, self._share_width, self._num_lanes)
 
     def _sharers_of(self, sg: int) -> frozenset:
         """The consumers of group ``sg``: the rendezvous width. Derived from
@@ -586,7 +599,7 @@ class _RDTProducerServer:
             if not self._sharing_active or self._consumer_ids is None:
                 cached = frozenset((sg,))
             else:
-                cached = frozenset(c for c in self._consumer_ids if c % self._share_width == sg) or frozenset((sg,))
+                cached = frozenset(c for c in self._consumer_ids if self._share_group(c) == sg) or frozenset((sg,))
             self._sharers[sg] = cached
         return cached
 
@@ -826,6 +839,9 @@ class SkyRLShardedRDTTrainerWeightTransferEngine(TrainerWeightTransferEngine[Sky
         self._name_owner_class: list[int] = []
         self._owned_idx: list[int] = []
         self._held_names: set[str] | None = None
+        # Per producer rank, its lane (``plan_producer_lanes``), one entry per
+        # producer.
+        self._producer_lane: list[int] = []
         # Strong refs to gathered tensors we've shared into the server, keyed by
         # group index. CUDA-IPC exports must outlive the importer, so we hold
         # them until the server reports the group freed. See send_weights.
@@ -950,8 +966,10 @@ class SkyRLShardedRDTTrainerWeightTransferEngine(TrainerWeightTransferEngine[Sky
         client: VLLMWeightSyncClient,
         source: WeightSource | None = None,
     ) -> Self:
-        if source is None:
-            raise ValueError("Sharded RDT trainer weight transfer requires a WeightSource.")
+        if not isinstance(source, GroupedWeightSource):
+            raise TypeError(
+                f"Sharded RDT trainer weight transfer requires a GroupedWeightSource, got {type(source)!r}."
+            )
         engine = cls(
             client=client,
             source=source,
@@ -1017,8 +1035,16 @@ class SkyRLShardedRDTTrainerWeightTransferEngine(TrainerWeightTransferEngine[Sky
         The masks are positional over metadata order, which is why the metadata
         digest is checked first: a rank whose names disagree would transpose into
         the wrong owners entirely.
+
+        Each rank's ``GroupedWeightSource.trainer_copy()`` rides the same
+        collective, so the fleet also derives each producer's lane.
+
+        Raises:
+            ValueError: the metadata disagrees across ranks, a name has no
+                owner, or the trainer copies are not disjoint and full (they
+                disagree on ``num_copies``, or one does not hold some name).
         """
-        assert self.source is not None  # guaranteed by trainer_init
+        assert isinstance(self.source, GroupedWeightSource)  # guaranteed by trainer_init
         num_groups = len(self._groups)
         names = [m.name for m in self._meta]
         held = self.source.held_names()
@@ -1046,7 +1072,8 @@ class SkyRLShardedRDTTrainerWeightTransferEngine(TrainerWeightTransferEngine[Sky
         for i, n in enumerate(names):
             if n in held_set:
                 mask[i >> 3] |= 1 << (i & 7)
-        per_rank = self._all_gather_owned(world, (digest, bytes(mask)))
+        own_copy = self.source.trainer_copy()
+        per_rank = self._all_gather_owned(world, (digest, bytes(mask), own_copy))
         mismatched = [r for r, (d, *_rest) in enumerate(per_rank) if d != digest]
         if mismatched:
             raise ValueError(
@@ -1055,7 +1082,7 @@ class SkyRLShardedRDTTrainerWeightTransferEngine(TrainerWeightTransferEngine[Sky
                 "Every rank must describe the WHOLE model, even when it holds "
                 "only some of it."
             )
-        masks = [m for _d, m in per_rank]
+        masks = [m for _d, m, _r in per_rank]
 
         # Transpose to per-name owners, then dedup into classes. Numbering by
         # FIRST APPEARANCE in metadata order keeps it a pure function of
@@ -1079,9 +1106,41 @@ class SkyRLShardedRDTTrainerWeightTransferEngine(TrainerWeightTransferEngine[Sky
 
         self._owner_sets = owner_sets
         self._name_owner_class = name_owner_class
+        self._producer_lane = self._plan_lanes(rank, [c for _d, _m, c in per_rank])
         # Groups holding anything here: exactly what iteration must cover.
         self._owned_idx = [gi for gi in range(num_groups) if any(n in held_set for n in self._groups[gi])]
         self._held_names = held_set
+
+    def _plan_lanes(self, rank: int, rank_copies: list[TrainerCopy]) -> list[int]:
+        """``plan_producer_lanes`` over this fleet's ownership tables. Pure in
+        rank-identical inputs, so every rank derives the same table (or raises
+        the same error); rank 0 logs it."""
+        pos = 0
+        group_owners: list[list[int]] = []
+        for g in self._groups:
+            union: set[int] = set()
+            for c in self._name_owner_class[pos : pos + len(g)]:
+                union.update(self._owner_sets[c])
+            group_owners.append(sorted(union))
+            pos += len(g)
+        plan = plan_producer_lanes(
+            [m.name for m in self._meta],
+            self._name_owner_class,
+            self._owner_sets,
+            group_owners,
+            rank_copies,
+            self._init_info.workers_per_replica,
+        )
+        if rank == 0:
+            logger.info(
+                "[rdt-config] trainer copies=%d -> %d lane(s) "
+                "(lane cap %d = min owners per gather group // workers_per_replica=%d)",
+                plan.num_copies,
+                max(plan.producer_lane) + 1,
+                plan.lane_cap,
+                self._init_info.workers_per_replica,
+            )
+        return plan.producer_lane
 
     def _validate_held_yields(self, gi: int, names, tensors) -> None:
         """Check ``held_names()`` against what the source actually yields — the
@@ -1130,7 +1189,7 @@ class SkyRLShardedRDTTrainerWeightTransferEngine(TrainerWeightTransferEngine[Sky
         return h.hexdigest()[:16]
 
     def _all_gather_owned(self, world: int, mine: tuple) -> list[tuple]:
-        """All-gather each rank's (metadata digest, held-name bitmask)."""
+        """All-gather each rank's (metadata digest, held-name bitmask, trainer copy)."""
         if world <= 1 or not (torch.distributed.is_available() and torch.distributed.is_initialized()):
             return [mine]
         gathered: list[Any] = [None] * world
@@ -1201,18 +1260,25 @@ class SkyRLShardedRDTTrainerWeightTransferEngine(TrainerWeightTransferEngine[Sky
             scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_id, soft=False),
             runtime_env=runtime_env,
         )
-        self._server = server_cls.remote(
+        self._server = server_cls.remote(**self._server_kwargs(served_names))
+        ray.get(self._server.ping.remote())
+        # Pre-barrier NIXL warmup: must complete before the server-name
+        # all-gather so no rank can be inside a collective yet (see warmup_nixl).
+        ray.get(self._server.warmup_nixl.remote())
+
+    def _server_kwargs(self, served_names: list[str]) -> dict[str, Any]:
+        """``_RDTProducerServer`` constructor arguments for this rank."""
+        ii = self._init_info
+        return dict(
             served_names=served_names,
             num_rdt_buffers=ii.num_rdt_buffers,
             buffer_presize_gb=ii.buffer_presize_gb,
             gather_lookahead=ii.gather_lookahead,
             stall_timeout_s=ii.stall_timeout_s,
             workers_per_replica=ii.workers_per_replica,
+            num_consumers=ii.num_consumers,
+            producer_lane=self._producer_lane,
         )
-        ray.get(self._server.ping.remote())
-        # Pre-barrier NIXL warmup: must complete before the server-name
-        # all-gather so no rank can be inside a collective yet (see warmup_nixl).
-        ray.get(self._server.warmup_nixl.remote())
 
     def _build_worker_init_info(self, server_names: list[str]):
         from skyrl.backends.skyrl_train.weight_sync.sharded_rdt.sharded_rdt_engine import (
@@ -1233,6 +1299,7 @@ class SkyRLShardedRDTTrainerWeightTransferEngine(TrainerWeightTransferEngine[Sky
             group_lens=group_lens,
             owner_sets=self._owner_sets,
             name_owner_class=self._name_owner_class,
+            producer_lane=self._producer_lane,
             num_consumers=self._init_info.num_consumers,
             num_rdt_buffers=self._init_info.num_rdt_buffers,
             buffer_presize_gb=self._init_info.buffer_presize_gb,

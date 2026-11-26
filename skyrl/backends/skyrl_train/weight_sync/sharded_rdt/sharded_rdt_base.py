@@ -25,6 +25,7 @@ engines here still use ``held_names()``; moving them onto upstream's is a
 separate change, after which :class:`GroupedWeightSource` collapses into it.
 """
 
+from abc import abstractmethod
 from collections.abc import Collection, Iterator
 
 import torch
@@ -37,6 +38,10 @@ from vllm.distributed.weight_transfer.base import (
     materialize_full_tensor,
 )
 
+from skyrl.backends.skyrl_train.weight_sync.sharded_rdt.sharded_rdt_common import (
+    TrainerCopy,
+)
+
 __all__ = [
     "GroupedWeightSource",
     "ParamMeta",
@@ -46,6 +51,7 @@ __all__ = [
     "WeightSource",
     "layerwise_groups",
     "materialize_full_tensor",
+    "whole_model_copy",
 ]
 
 
@@ -119,6 +125,15 @@ def layerwise_groups(names: list[str]) -> list[list[str]]:
     return groups
 
 
+def whole_model_copy() -> TrainerCopy:
+    """The ``TrainerCopy`` of a source that holds every name on every rank: each
+    rank is its own full copy, ranked over the default process group the
+    trainer's producers span (one copy without one)."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return TrainerCopy(torch.distributed.get_rank(), torch.distributed.get_world_size())
+    return TrainerCopy(0, 1)
+
+
 class GroupedWeightSource(WeightSource):
     """A ``WeightSource`` with the ownership and group channels sharded RDT pulls over.
 
@@ -159,6 +174,20 @@ class GroupedWeightSource(WeightSource):
             The held parameter names, or None to hold every one.
         """
         return None
+
+    @abstractmethod
+    def trainer_copy(self) -> TrainerCopy:
+        """This rank's place among the trainer's disjoint full model copies.
+
+        Ranks sharing a ``copy_rank`` must together hold every name. Consumers
+        spread their deployments over the copies (by lane), so a name held once
+        per copy is served by every copy. The trainer raises at init on copies
+        that are not disjoint and full.
+
+        No default: the copy count is the source's data-parallel layout, which
+        only the source knows. A source holding every name on every rank
+        returns ``whole_model_copy()``; a wrapper returns its inner source's.
+        """
 
     def groups(self) -> list[list[str]]:
         """This rank's gather groups, in metadata order: `layerwise_groups` over
