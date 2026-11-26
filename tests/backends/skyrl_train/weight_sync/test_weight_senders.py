@@ -115,8 +115,8 @@ class TestPackedBufferSize:
 
 
 def test_max_param_numel_skips_tensors_that_are_never_synced(tmp_path):
-    """DeepSeek-V4.1's Engram tables stay in the inference engine; sizing the buffer for one would ask for
-    hundreds of GiB."""
+    """DeepSeek-V4.1's Engram tables and Qwen4Exp's PLE tables stay in the inference engine; sizing the
+    buffer for them would ask for tens to hundreds of GiB."""
     from safetensors.torch import save_file
 
     from skyrl.backends.skyrl_train.weight_sync.checkpoint_shapes import max_param_numel
@@ -126,6 +126,8 @@ def test_max_param_numel_skips_tensors_that_are_never_synced(tmp_path):
             "layers.1.engram.embed.weight": torch.zeros(64, 8),
             "layers.1.engram.embed.scale": torch.zeros(64, 1),
             "layers.1.engram.wkv.weight": torch.zeros(4, 8),
+            "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight": torch.zeros(128, 8),
+            "model.language_model.layers.1.ple.key_proj.weight": torch.zeros(4, 8),
             "embed.weight": torch.zeros(10, 8),
         },
         str(tmp_path / "model.safetensors"),

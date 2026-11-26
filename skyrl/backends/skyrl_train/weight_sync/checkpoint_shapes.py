@@ -28,10 +28,10 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["max_param_numel"]
 
-# Checkpoint tensors that never cross the wire, so they must not set the floor. DeepSeek-V4.1's Engram hash
-# tables (~384M x 256 FP8 each) are frozen buffers the inference engine loads itself; sized in bf16 they would
-# demand a 183 GiB transfer buffer.
-_NOT_SYNCED = re.compile(r"(^|\.)engram\.embed\.(weight|scale)$")
+# Checkpoint tensors that never cross the wire, so they must not set the floor:
+# - DeepSeek-V4.1's Engram hash tables (~384M x 256 FP8 each); sized in bf16 they would demand a 183 GiB buffer.
+# - Qwen4Exp's frozen PLE n-gram table (~51B params), loaded rank-locally by Qwen4ExpPLE.load_table and never exported.
+_NOT_SYNCED = re.compile(r"(^|\.)(engram\.embed\.(weight|scale)$|ple\.ple_embedding\.)")
 
 
 def max_param_numel(model_path: str) -> int:

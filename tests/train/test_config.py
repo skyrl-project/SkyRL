@@ -1111,6 +1111,20 @@ def test_offload_kv_for_weight_sync_rejects_lora():
         validate_inference_engine_cfg(cfg)
 
 
+def test_offload_kv_for_weight_sync_megatron_lora_merge_modes():
+    cfg = SkyRLTrainConfig()
+    cfg.trainer.strategy = "megatron"
+    cfg.trainer.placement.colocate_all = False
+    cfg.generator.inference_engine.offload_kv_for_weight_sync = True
+    cfg.trainer.policy.model.lora.rank = 16
+    cfg.trainer.policy.megatron_config.lora_config.merge_lora = True
+    validate_inference_engine_cfg(cfg)
+
+    cfg.trainer.policy.megatron_config.lora_config.merge_lora = False
+    with pytest.raises(AssertionError, match="does not support LoRA"):
+        validate_inference_engine_cfg(cfg)
+
+
 def test_offload_kv_for_weight_sync_sync_trainer_ok():
     # Non-fully-async (synchronous trainer) is supported: plain sleep, no in-flight.
     cfg = SkyRLTrainConfig()

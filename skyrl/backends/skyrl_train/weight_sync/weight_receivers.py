@@ -24,6 +24,7 @@ against the registry, so a new name is all that is needed.
 from __future__ import annotations
 
 import logging
+import weakref
 from contextlib import contextmanager
 from typing import Any, Iterator
 
@@ -63,6 +64,161 @@ class _LoadWeightsProxy:
         return getattr(self._model, name)
 
 
+def _get_layerwise_info_map() -> Any:
+    """Return vLLM's ``LAYERWISE_INFO`` mapping, or ``None`` if unavailable."""
+    try:
+        from vllm.model_executor.model_loader.reload.layerwise import LAYERWISE_INFO
+    except ImportError:
+        return None
+    return LAYERWISE_INFO
+
+
+def _detach_oversized_storage_views(obj: Any, cloned: list[torch.Tensor]) -> Any:
+    """Clone tensors that pin a much larger underlying storage (e.g. a packed NCCL chunk).
+
+    vLLM 0.33's ``packed_nccl_broadcast_consumer`` unpacks each chunk as views into one
+    multi-GB ``packed`` buffer (unlike ``packed_ipc_consumer``, which clones per tensor).
+    When ``layerwise`` reload retains any tensor across chunks -- e.g. padded layers
+    like Qwen4Exp's ``GatedResidual.input_mix_weight_down_block_inject`` (``pad_size=12``),
+    deferred attention layers, or layers split across chunk boundaries -- that small view
+    pins the entire multi-GB chunk buffer until ``finalize_layerwise_processing`` runs in
+    ``/finish_weight_update``.
+
+    Detaching whenever ``storage_bytes >= 2 * tensor.nbytes`` frees the oversized chunk
+    buffer immediately while avoiding a redundant copy of a large tensor that already
+    occupies more than half of its chunk.
+    """
+    if isinstance(obj, torch.Tensor):
+        if obj.is_meta:
+            return obj
+        try:
+            storage_bytes = obj.untyped_storage().nbytes()
+        except Exception:  # noqa: BLE001 - tensor subclasses without untyped storage
+            return obj
+        if storage_bytes > 0 and storage_bytes >= 2 * obj.nbytes:
+            copy = obj.detach().clone()
+            cloned.append(copy)
+            return copy
+        return obj
+    if isinstance(obj, tuple):
+        changed = False
+        items = []
+        for item in obj:
+            new_item = _detach_oversized_storage_views(item, cloned)
+            if new_item is not item:
+                changed = True
+            items.append(new_item)
+        return tuple(items) if changed else obj
+    if isinstance(obj, list):
+        changed = False
+        items = []
+        for item in obj:
+            new_item = _detach_oversized_storage_views(item, cloned)
+            if new_item is not item:
+                changed = True
+            items.append(new_item)
+        return items if changed else obj
+    if isinstance(obj, dict):
+        changed = False
+        out = {}
+        for k, v in obj.items():
+            new_v = _detach_oversized_storage_views(v, cloned)
+            if new_v is not v:
+                changed = True
+            out[k] = new_v
+        return out if changed else obj
+    return obj
+
+
+def detach_buffered_layerwise_views(layerwise_info: Any = None) -> list[torch.Tensor]:
+    """Detach any views buffered in vLLM's ``LAYERWISE_INFO`` that pin a larger chunk storage.
+
+    Returns the newly cloned tensors so the caller can synchronize CUDA streams when
+    packed receive alternates across multiple streams.
+    """
+    if layerwise_info is None:
+        layerwise_info = _get_layerwise_info_map()
+    if not layerwise_info:
+        return []
+    cloned: list[torch.Tensor] = []
+    for info in list(layerwise_info.values()):
+        loaded_weights = getattr(info, "loaded_weights", None)
+        if not loaded_weights:
+            continue
+        for entry in loaded_weights:
+            if not isinstance(entry, tuple) or len(entry) < 2:
+                continue
+            bound_args = entry[1]
+            arguments = getattr(bound_args, "arguments", None)
+            if not isinstance(arguments, dict):
+                continue
+            for key, val in list(arguments.items()):
+                if key == "param":
+                    continue
+                new_val = _detach_oversized_storage_views(val, cloned)
+                if new_val is not val:
+                    arguments[key] = new_val
+    return cloned
+
+
+class _DetachedCloneStreamTracker:
+    """Round-scoped CUDA stream ordering and allocator-lifetime tracking for detached views.
+
+    vLLM 0.33's packed NCCL consumer alternates across multiple receive streams and records
+    its inter-stream event *before* calling ``load_weights``; later, ``finish_weight_update``
+    replays any remaining buffered tensors on the caller stream. This tracker lives for the
+    whole update round (across one or more ``receive_weights`` calls through
+    ``finish_weight_update``) so every consumer stream waits for async clones from other
+    streams and is registered via ``record_stream`` before any clone can be freed.
+    """
+
+    def __init__(self) -> None:
+        self._last_clone_events: dict[int, Any] = {}
+        self._waited_events: dict[tuple[int, int], Any] = {}
+        self._seen_streams: dict[int, Any] = {}
+        self._detached_refs: list[weakref.ref[torch.Tensor]] = []
+
+    def prepare_stream(self, device: Any) -> None:
+        """Order ``current_stream(device)`` after other streams' clones and register it."""
+        if not torch.cuda.is_available():
+            return
+        dev = torch.device(device)
+        if dev.type != "cuda":
+            return
+        cur_stream = torch.cuda.current_stream(dev)
+        cur_id = cur_stream.cuda_stream
+        for producer_id, ev in self._last_clone_events.items():
+            if producer_id != cur_id and self._waited_events.get((cur_id, producer_id)) is not ev:
+                cur_stream.wait_event(ev)
+                self._waited_events[(cur_id, producer_id)] = ev
+        if cur_id not in self._seen_streams:
+            self._seen_streams[cur_id] = cur_stream
+            alive: list[weakref.ref[torch.Tensor]] = []
+            for ref in self._detached_refs:
+                tensor = ref()
+                if tensor is not None:
+                    tensor.record_stream(cur_stream)
+                    alive.append(ref)
+            self._detached_refs[:] = alive
+
+    def record_clones(self, tensors: list[torch.Tensor]) -> None:
+        """Record a completion event on the producing stream and register all known streams."""
+        cuda_tensors = [t for t in tensors if t.is_cuda]
+        if not cuda_tensors:
+            return
+        cur_stream = torch.cuda.current_stream(cuda_tensors[0].device)
+        cur_id = cur_stream.cuda_stream
+        self._seen_streams.setdefault(cur_id, cur_stream)
+        ev = torch.cuda.Event()
+        ev.record(cur_stream)
+        self._last_clone_events[cur_id] = ev
+        for tensor in cuda_tensors:
+            self._detached_refs.append(weakref.ref(tensor))
+            for sid, stream in self._seen_streams.items():
+                if sid != cur_id:
+                    tensor.record_stream(stream)
+
+
 class SkyrlCheckpointLoadMixin:
     """Split the compact batched-MoE FP8 wire tensors from ordinary checkpoint weights."""
 
@@ -88,8 +244,21 @@ class SkyrlCheckpointLoadMixin:
             stacked = Nvfp4StackedReceiver(model, fallback_load=lambda w: model.load_weights(weights=w))
             self._skyrl_nvfp4_stacked = stacked
 
+        tracker = getattr(self, "_skyrl_detached_clone_tracker", None)
+        if tracker is None:
+            tracker = _DetachedCloneStreamTracker()
+            self._skyrl_detached_clone_tracker = tracker
+        # Register the caller stream up front (before packed NCCL switches to its receive
+        # streams) so every detached clone records the caller stream for finalization.
+        tracker.prepare_stream(self.device)
+
         def load_weights(weights: Any, **kwargs: Any) -> Any:
-            return _load_checkpoint_weights(model, weights, nvfp4_stacked_receiver=stacked, **kwargs)
+            tracker.prepare_stream(self.device)
+            result = _load_checkpoint_weights(model, weights, nvfp4_stacked_receiver=stacked, **kwargs)
+            cloned = detach_buffered_layerwise_views()
+            if cloned:
+                tracker.record_clones(cloned)
+            return result
 
         # The proxy scopes the override to the `WeightTransferEngine` context
         # instead of mutating `load_weights` on the model object itself.
@@ -274,8 +443,10 @@ class SkyrlReceiveLifecycleMixin(SkyrlLoraStagingMixin, SkyrlCheckpointLoadMixin
             self.skyrl_begin_lora_update()
             return
         skyrl_before_weight_update()
-        # A round that failed part-way must not leak its partial stacked NVFP4 layers into this one.
+        # A round that failed part-way must not leak its partial stacked NVFP4 layers or
+        # detached-clone stream tracking into this one.
         self._skyrl_nvfp4_stacked = None
+        self._skyrl_detached_clone_tracker = _DetachedCloneStreamTracker()
         with torch.device(self.device):
             super().start_weight_update()
 
@@ -320,9 +491,15 @@ class SkyrlReceiveLifecycleMixin(SkyrlLoraStagingMixin, SkyrlCheckpointLoadMixin
 
         stacked = getattr(self, "_skyrl_nvfp4_stacked", None)
         self._skyrl_nvfp4_stacked = None
+        tracker = getattr(self, "_skyrl_detached_clone_tracker", None)
+        self._skyrl_detached_clone_tracker = None
         if stacked is not None:
             stacked.finish()  # raises on a stacked layer that never completed
         with torch.device(self.device):
+            if tracker is not None:
+                # Ensure the finalization stream waits on any remaining clone events and is
+                # recorded on every surviving detached clone before finalize frees them.
+                tracker.prepare_stream(self.device)
             super().finish_weight_update()
             # A level-2 sleep zeroes MoE kernel constants that no reload rebuilds.
             restore_moe_kernel_constants(self.model)
@@ -335,6 +512,13 @@ def _build_skyrl_nccl_engine() -> type:
 
     class SkyrlNCCLWeightTransferEngine(SkyrlReceiveLifecycleMixin, NCCLWeightTransferEngine):
         """vLLM's dense NCCL receive engine plus SkyRL receive targets."""
+
+        def finish_weight_update(self) -> None:
+            super().finish_weight_update()
+            # vLLM 0.33's NCCL receiver allocates packed buffers on dedicated receive streams
+            # without releasing cached blocks on finish (fixed upstream in vllm#64691).
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     return SkyrlNCCLWeightTransferEngine
 

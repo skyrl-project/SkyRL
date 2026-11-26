@@ -1080,8 +1080,11 @@ def validate_inference_engine_cfg(cfg: SkyRLTrainConfig):
             "offload_kv_for_weight_sync is for non-colocated weight sync only; "
             "colocated mode already sleeps the engines and wakes weights/KV cache around sync."
         )
-        assert cfg.trainer.policy.model.lora.rank == 0, (
-            "offload_kv_for_weight_sync does not support LoRA weight sync "
+        is_adapter_sync = cfg.trainer.policy.model.lora.rank > 0 and not (
+            cfg.trainer.strategy == "megatron" and cfg.trainer.policy.megatron_config.lora_config.merge_lora
+        )
+        assert not is_adapter_sync, (
+            "offload_kv_for_weight_sync does not support LoRA adapter weight sync "
             "(the in-place LoRA adapter swap path does not go through the sleep/wake broadcast)."
         )
         assert (
