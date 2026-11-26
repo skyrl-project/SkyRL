@@ -188,6 +188,24 @@ def _iter_transformer_layer_modules(model: nn.Module, decoder: nn.Module) -> Ite
         yield from mtp.layers.modules()
 
 
+def freeze_moe_expert_bias(model_or_models: Union[nn.Module, List[nn.Module]]):
+    """Stop Megatron's per-step update of the MoE expert bias.
+
+    Routers built with ``moe_router_enable_expert_bias`` carry an ``expert_bias`` buffer that
+    ``finalize_model_grads`` moves after every step to balance expert load. The update uses no
+    gradient, so ``requires_grad=False`` does not reach it; ``frozen_expert_bias`` is Megatron's
+    per-router switch for it. Every module with an ``expert_bias`` is flagged, wherever it sits
+    (decoder, MTP, multimodal language model, adapter wrapper).
+    """
+    models = model_or_models if isinstance(model_or_models, list) else [model_or_models]
+    for model in models:
+        for module in model.modules():
+            if getattr(module, "expert_bias", None) is not None:
+                module.frozen_expert_bias = True
+    # modified in-place
+    return model_or_models
+
+
 def freeze_moe_router(model_or_models: Union[nn.Module, List[nn.Module]]):
     models = model_or_models
     if not isinstance(model_or_models, list):
@@ -204,12 +222,23 @@ def freeze_moe_router(model_or_models: Union[nn.Module, List[nn.Module]]):
             continue
         for layer in _iter_transformer_layer_modules(model, decoder):
             if hasattr(layer, "mlp") and hasattr(layer.mlp, "router"):
+                if getattr(layer.mlp.router, "qb_beta_accum", None) is not None:
+                    raise ValueError(
+                        "trainer.policy.megatron_config.freeze_moe_router cannot keep routing fixed with "
+                        "quantile balancing in its 'micro_batch' estimation scope: Megatron updates that "
+                        "routing bias (qb_beta) after every step regardless. Set "
+                        "trainer.policy.megatron_config.transformer_config_kwargs."
+                        "moe_router_quantile_balancing_estimation_scope='global_batch', whose bias the "
+                        "freeze covers."
+                    )
                 if getattr(layer.mlp.router, "weight", None) is not None:
                     layer.mlp.router.weight.requires_grad = False
                     froze_any = True
                 if getattr(layer.mlp.router, "bias", None) is not None:
                     layer.mlp.router.bias.requires_grad = False
                     froze_any = True
+
+    freeze_moe_expert_bias(models)
 
     if not froze_any:
         logger.warning(

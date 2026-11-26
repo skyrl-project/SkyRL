@@ -1,13 +1,16 @@
-"""Smoke tests for the ``freeze_moe_router`` helper.
+"""Tests for the ``freeze_moe_router`` helper.
 
 The helper walks the subtrees of ``model.decoder.layers`` and ``model.mtp.layers``
-(under ``model.language_model`` for multimodal models) and flips ``requires_grad`` on
-router weights/biases. These tests build minimal mock modules that mimic Megatron-Core's attribute layout
-without importing Megatron.
+(under ``model.language_model`` for multimodal models), flips ``requires_grad`` on
+router weights/biases, and stops Megatron's per-step expert-bias update. These tests build
+minimal mock modules that mimic Megatron-Core's attribute layout; the expert-bias tests run
+Megatron's real update function on them.
 
 Run with:
 uv run --isolated --extra dev --extra megatron -- pytest -s tests/backends/skyrl_train/workers/megatron/test_freeze_moe_router.py
 """
+
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -15,6 +18,10 @@ import torch.nn as nn
 from loguru import logger
 
 pytest.importorskip("megatron.core", reason="requires the megatron extra")
+
+from megatron.core.distributed.finalize_model_grads import (  # noqa: E402
+    _update_router_expert_bias,
+)
 
 from skyrl.backends.skyrl_train.distributed.megatron.megatron_utils import (  # noqa: E402
     freeze_moe_router,
@@ -57,6 +64,15 @@ class _Model(nn.Module):
     def __init__(self, n_layers: int = 2, **mlp_kwargs):
         super().__init__()
         self.decoder = _Decoder(n_layers=n_layers, **mlp_kwargs)
+
+
+class _MTPLayer(nn.Module):
+    """An MTP depth: ``model.mtp.layers[i].mtp_model_layer``, beside the decoder."""
+
+    def __init__(self):
+        super().__init__()
+        self.eh_proj = nn.Linear(16, 8)
+        self.mtp_model_layer = _Layer()
 
 
 @pytest.mark.megatron
@@ -260,13 +276,6 @@ def test_freeze_moe_router_warns_when_nothing_frozen():
 @pytest.mark.megatron
 def test_freeze_moe_router_mtp_layers():
     """MTP depths sit at ``model.mtp.layers[i].mtp_model_layer``, beside the decoder."""
-
-    class _MTPLayer(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.eh_proj = nn.Linear(16, 8)
-            self.mtp_model_layer = _Layer()
-
     m = _Model()
     m.mtp = nn.Module()
     m.mtp.layers = nn.ModuleList([_MTPLayer()])
@@ -280,3 +289,59 @@ def test_freeze_moe_router_mtp_layers():
     assert mtp_layer.eh_proj.weight.requires_grad is True
     for layer in m.decoder.layers:
         assert layer.mlp.router.weight.requires_grad is False
+
+
+# Uneven token counts with a mean of 3: Megatron lowers expert 0's bias by the rate, raises
+# expert 1's, and leaves experts 2 and 3, which sit exactly at the mean, alone.
+_TOKENS_PER_EXPERT = [6, 0, 3, 3]
+_BIAS_UPDATE_RATE = 1e-3
+
+
+def _add_expert_bias(router: nn.Module) -> None:
+    """Give a mock router the two buffers Megatron's ``TopKRouter`` registers when
+    ``moe_router_enable_expert_bias`` is on: the bias and this step's token counts."""
+    router.register_buffer("expert_bias", torch.zeros(len(_TOKENS_PER_EXPERT), dtype=torch.float32))
+    router.register_buffer(
+        "local_tokens_per_expert", torch.tensor(_TOKENS_PER_EXPERT, dtype=torch.int64), persistent=False
+    )
+
+
+@pytest.mark.megatron
+@pytest.mark.parametrize("freeze", [False, True], ids=["not_frozen", "frozen"])
+def test_freeze_moe_router_stops_expert_bias_update(monkeypatch, freeze):
+    """Megatron moves each router's expert bias after every step, in ``finalize_model_grads``,
+    without a gradient. A frozen router keeps its bias, on decoder and MTP layers alike; an
+    unfrozen one moves, which shows the update really ran."""
+    m = _Model()
+    m.mtp = nn.Module()
+    m.mtp.layers = nn.ModuleList([_MTPLayer()])
+    routers = [layer.mlp.router for layer in m.decoder.layers] + [m.mtp.layers[0].mtp_model_layer.mlp.router]
+    for router in routers:
+        _add_expert_bias(router)
+
+    if freeze:
+        freeze_moe_router(m)
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda tensor, group=None, **kwargs: None)
+    _update_router_expert_bias(
+        [m], SimpleNamespace(moe_router_bias_update_rate=_BIAS_UPDATE_RATE), tp_dp_cp_group=object()
+    )
+
+    expected = (
+        torch.zeros(len(_TOKENS_PER_EXPERT))
+        if freeze
+        else torch.tensor([-_BIAS_UPDATE_RATE, _BIAS_UPDATE_RATE, 0.0, 0.0])
+    )
+    for router in routers:
+        torch.testing.assert_close(router.expert_bias, expected)
+
+
+@pytest.mark.megatron
+def test_freeze_moe_router_rejects_micro_batch_quantile_balancing():
+    """Quantile balancing in its default ``micro_batch`` scope routes with its own bias, ``qb_beta``,
+    which Megatron updates every step without checking ``frozen_expert_bias``, so the freeze
+    cannot hold routing fixed. The error names the scope that it can hold."""
+    m = _Model()
+    m.decoder.layers[0].mlp.router.register_buffer("qb_beta_accum", torch.zeros(len(_TOKENS_PER_EXPERT)))
+
+    with pytest.raises(ValueError, match="moe_router_quantile_balancing_estimation_scope='global_batch'"):
+        freeze_moe_router(m)

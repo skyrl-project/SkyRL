@@ -490,6 +490,10 @@ class MegatronOptimizerOffloadToDiskConfig(BaseConfig):
 
 @dataclass
 class MegatronLoraConfig(BaseConfig):
+    """Megatron LoRA settings. LoRA keeps the base model as loaded, MoE routing included: the expert
+    bias that DeepSeek-style routers move for load balancing (``e_score_correction_bias``) is frozen
+    too, with either ``merge_lora`` setting."""
+
     lora_type: str = "lora"
     """``"lora"`` or ``"canonical_lora"``.
     See https://docs.nvidia.com/nemo/megatron-bridge/0.2.0/apidocs/bridge/bridge.peft.lora.html"""
@@ -796,8 +800,11 @@ class MegatronConfig(BaseConfig):
     supports resharding along the data-parallel dimension. See
     https://github.com/NVIDIA/Megatron-LM/blob/core_v0.16.0/megatron/core/optimizer/distrib_optimizer.py"""
     freeze_moe_router: bool = False
-    """If True, freeze MoE router parameters so they are not updated during training. No-op on
-    non-MoE models."""
+    """If True, keep MoE routing fixed during training: the router weights get no gradient, and the
+    expert bias that DeepSeek-style routers use for load balancing (``e_score_correction_bias``) is
+    not updated after each step. Raises with quantile balancing in its ``micro_batch`` estimation
+    scope, whose routing bias Megatron updates regardless. No-op on non-MoE models. With LoRA the
+    expert bias is frozen whether or not this is set."""
     freeze_dsa_indexer: bool = False
     """If True, freeze the dynamic-sparse-attention indexer parameters. The indexer emits top-k
     *indices*, which are not differentiable. With auxiliary indexer loss disabled, these parameters
