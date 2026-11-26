@@ -93,7 +93,10 @@ skyrl-train = [
     # Since Ray 2.60, ray.serve imports grpc_reflection at module level, and only the
     # `ray[serve]` extra installs it. Without it, every vLLM engine fails at start with
     # "ImportError: RayPrometheusMetric requires Ray to be installed."
-    "grpcio-reflection",
+    # Ray fixed this in ray-project/ray#67444 (Ray 2.61); remove this and the protobuf
+    # pin in override-dependencies when SkyRL moves to Ray >= 2.61.
+    # <1.82: 1.81.x is the newest series that declares protobuf<7, matching that pin.
+    "grpcio-reflection<1.82",
     "peft==0.21.0",
     "debugpy==1.8.0",
     "hf_transfer",
@@ -338,14 +341,12 @@ conflicts = [
 no-build-isolation-package = [
     "nv-grouped-gemm",
 ]
-# Keep protobuf 6 on the platforms we run. Without this cap, adding grpcio-reflection
-# (needed by ray.serve since Ray 2.60) lets uv merge resolutions and move every extra
-# to protobuf 7. s390x is excluded because one of its resolutions requires protobuf 7.
-constraint-dependencies = ["protobuf<7; platform_machine != 's390x'"]
-
 # override unnecessary dependencies and pin versions to override Megatron-Bridge
 # unpinned dependencies.
 override-dependencies = [
+    # Pin protobuf for now. Without the pin, adding grpcio-reflection (needed by ray.serve
+    # on Ray 2.60) lets uv move every extra to protobuf 7. Remove with grpcio-reflection.
+    "protobuf==6.33.6",
     "transformer-engine[pytorch]==2.19.0; sys_platform == 'linux'",
     "transformers>=5.6.1,<=5.16.1; sys_platform == 'linux'",
     "megatron-core>=0.16.0; sys_platform == 'linux'",
