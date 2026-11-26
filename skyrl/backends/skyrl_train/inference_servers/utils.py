@@ -75,9 +75,18 @@ def _serialized_fp8_engine_exclude_list(
     return engine_exclude_list(spec, hf_config, wire_format, user_provided_exclude_list)
 
 
-def _set_or_validate(mapping: Dict[str, Any], key: str, expected: Any, *, context: str) -> None:
+_FP8_REASON = "FP8 weight sync is enabled"
+_NVFP4_REASON = "trainer.policy.megatron_config.expert_nvfp4 is enabled"
+
+
+def _set_or_validate(mapping: Dict[str, Any], key: str, expected: Any, *, context: str, reason: str) -> None:
+    """Sets ``mapping[key] = expected``; raises if the user already set it to something else.
+
+    ``reason`` names the feature that requires ``expected`` (e.g. ``"FP8 weight sync is enabled"``) so the
+    error points the user at the setting that actually conflicts.
+    """
     if key in mapping and mapping[key] != expected:
-        raise ValueError(f"{context}.{key} must be {expected!r} when FP8 weight sync is enabled, got {mapping[key]!r}")
+        raise ValueError(f"{context}.{key} must be {expected!r} when {reason}, got {mapping[key]!r}")
     mapping[key] = copy.deepcopy(expected)
 
 
@@ -98,10 +107,10 @@ def _apply_serialized_fp8_weight_sync_defaults(
         return
     # wire_to_engine_quantization raises on anything outside WIRE_FORMATS.
     quant_method = wire_to_engine_quantization(mode)
-    _set_or_validate(engine_kwargs, "quantization", quant_method, context="engine_init_kwargs")
+    _set_or_validate(engine_kwargs, "quantization", quant_method, context="engine_init_kwargs", reason=_FP8_REASON)
     # Build FP8 modules without a bootstrap checkpoint; the first full-weight
     # sync replaces the dummy values.
-    _set_or_validate(engine_kwargs, "load_format", "dummy", context="engine_init_kwargs")
+    _set_or_validate(engine_kwargs, "load_format", "dummy", context="engine_init_kwargs", reason=_FP8_REASON)
 
     hf_overrides_value = engine_kwargs.get("hf_overrides")
     hf_overrides = {} if hf_overrides_value is None else copy.deepcopy(hf_overrides_value)
@@ -147,18 +156,25 @@ def _apply_expert_nvfp4_weight_sync_defaults(cfg: SkyRLTrainConfig, engine_kwarg
         nvfp4_bf16_layers(hf_config.num_hidden_layers, cfg.trainer.policy.megatron_config)
     )
     for key in ("quantization", "load_format", "quantization_config"):
-        _set_or_validate(engine_kwargs, key, overrides[key], context="engine_init_kwargs")
+        _set_or_validate(engine_kwargs, key, overrides[key], context="engine_init_kwargs", reason=_NVFP4_REASON)
     hf_overrides = copy.deepcopy(engine_kwargs.get("hf_overrides") or {})
     _set_or_validate(
         hf_overrides,
         "quantization_config",
         overrides["hf_overrides"]["quantization_config"],
         context="engine_init_kwargs.hf_overrides",
+        reason=_NVFP4_REASON,
     )
     engine_kwargs["hf_overrides"] = hf_overrides
     # Per-token NVFP4 activations exist only on the FlashInfer TRT-LLM MoE backend.
     kernel_config = copy.deepcopy(engine_kwargs.get("kernel_config") or {})
-    _set_or_validate(kernel_config, "moe_backend", "flashinfer_trtllm", context="engine_init_kwargs.kernel_config")
+    _set_or_validate(
+        kernel_config,
+        "moe_backend",
+        "flashinfer_trtllm",
+        context="engine_init_kwargs.kernel_config",
+        reason=_NVFP4_REASON,
+    )
     engine_kwargs["kernel_config"] = kernel_config
 
 
