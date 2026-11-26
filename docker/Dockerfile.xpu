@@ -1,0 +1,37 @@
+FROM ubuntu:24.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update -y && apt-get install -y wget curl ca-certificates git kmod libxml2 build-essential libnuma-dev \
+    python3.12 python3.12-dev python3.12-venv
+
+RUN curl -LsSf https://astral.sh/uv/0.9.4/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+ENV RAY_RUNTIME_ENV_HOOK=ray._private.runtime_env.uv_runtime_env_hook.hook
+
+RUN apt-get update \
+    && apt-get install -y openssh-server iputils-ping net-tools iproute2 traceroute netcat-openbsd \
+    libopenexr-dev libxi-dev libglfw3-dev libglew-dev libomp-dev libxinerama-dev libxcursor-dev tzdata \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+RUN apt update && apt install --fix-broken && apt install -y default-jre-headless openjdk-8-jdk \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Intel GPU user-space driver (Level Zero + OpenCL), the XPU counterpart of the CUDA
+# libraries in the cu130 base. Same releases as vllm/vllm-openai-xpu:v0.32.0. The kernel
+# driver (xe) comes from the host.
+ARG IGC=2.38.2+22051
+ARG COMPUTE_RUNTIME=26.27.39122.11
+ARG GMMLIB=22.10.0
+ARG LEVEL_ZERO=1.32.0
+RUN set -eux; mkdir /tmp/gpu && cd /tmp/gpu; \
+    igc=https://github.com/intel/intel-graphics-compiler/releases/download/v${IGC%%+*}; \
+    cr=https://github.com/intel/compute-runtime/releases/download/${COMPUTE_RUNTIME}; \
+    wget -q "$igc/intel-igc-core-2_${IGC}_amd64.deb" "$igc/intel-igc-opencl-2_${IGC}_amd64.deb" \
+        "$cr/intel-opencl-icd_${COMPUTE_RUNTIME}-0_amd64.deb" "$cr/libze-intel-gpu1_${COMPUTE_RUNTIME}-0_amd64.deb" \
+        "$cr/libigdgmm12_${GMMLIB}_amd64.deb" "$cr/intel-ocloc_${COMPUTE_RUNTIME}-0_amd64.deb" \
+        "https://github.com/oneapi-src/level-zero/releases/download/v${LEVEL_ZERO}/libze1_${LEVEL_ZERO}+u24.04_amd64.deb" \
+        "https://github.com/oneapi-src/level-zero/releases/download/v${LEVEL_ZERO}/libze-dev_${LEVEL_ZERO}+u24.04_amd64.deb"; \
+    apt-get update -y; \
+    apt-get install -y --no-install-recommends ocl-icd-libopencl1 ./*.deb; \
+    apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/gpu

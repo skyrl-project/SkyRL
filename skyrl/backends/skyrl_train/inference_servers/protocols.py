@@ -94,7 +94,7 @@ class ServerActorProtocol(Protocol):
             mooncake_bootstrap_base_port: Base port for Mooncake bootstrap server.
             colocated_training: Whether the server is colocated with training workers.
             **kwargs: Additional engine-specific keyword arguments (e.g.
-                ``distributed_executor_backend``, ``mp_cuda_visible_devices``).
+                ``distributed_executor_backend``, ``mp_visible_devices``).
         """
         ...
 

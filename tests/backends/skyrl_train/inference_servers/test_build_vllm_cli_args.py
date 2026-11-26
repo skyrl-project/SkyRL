@@ -13,6 +13,7 @@ from skyrl.backends.skyrl_train.inference_servers.utils import (
     get_pd_p2p_connector_name,
     resolve_policy_model_name,
 )
+from skyrl.backends.skyrl_train.utils.device import _ENABLED_TRAINING_ACCELERATORS
 from skyrl.train.config import SkyRLTrainConfig
 
 
@@ -130,17 +131,22 @@ def test_serialized_fp8_rejects_unsupported_model_layout(monkeypatch):
 
 
 @pytest.mark.vllm
-def test_build_vllm_cli_args_succeeds_on_gpu_less_host(monkeypatch):
+@pytest.mark.parametrize("dev_type", sorted(_ENABLED_TRAINING_ACCELERATORS))
+def test_build_vllm_cli_args_succeeds_on_gpu_less_host(monkeypatch, dev_type):
     import vllm.platforms
     from vllm.platforms.interface import UnspecifiedPlatform
+    import skyrl.backends.skyrl_train.inference_servers.utils as inference_utils
 
     # Simulate the GPU-less Ray head-node case: vLLM resolves current_platform
     # to UnspecifiedPlatform (device_type == ""), so AsyncEngineArgs.add_cli_args
     # walks VllmConfig defaults, instantiates DeviceConfig() and its
     # __post_init__ raises "Failed to infer device type" during arg parsing.
     # With the fix in build_vllm_cli_args, current_platform.device_type is
-    # pinned to "cuda" before add_cli_args runs.
+    # pinned to the device type torch was built for before add_cli_args runs.
     monkeypatch.setattr(vllm.platforms, "_current_platform", UnspecifiedPlatform())
+    # Override the build's device type so every enabled accelerator is tested on any host.
+    # Patched on inference_utils because it imports device_type by name.
+    monkeypatch.setattr(inference_utils, "device_type", lambda: dev_type)
 
     cfg = SkyRLTrainConfig()
     cfg.generator.inference_engine.served_model_name = "served-alias"
@@ -154,7 +160,7 @@ def test_build_vllm_cli_args_succeeds_on_gpu_less_host(monkeypatch):
     assert args.served_model_name == ["served-alias"]
     assert args.tensor_parallel_size == cfg.generator.inference_engine.tensor_parallel_size
     assert args.hf_overrides["rope_parameters"] == {"rope_type": "linear", "factor": 2.0, "rope_theta": 10000.0}
-    assert vllm.platforms.current_platform.device_type == "cuda"
+    assert vllm.platforms.current_platform.device_type == dev_type
 
     # NOTE: the MTP speculative_config wiring test lives in
     # tests/backends/skyrl_train/mtp/test_build_vllm_cli_args_mtp.py

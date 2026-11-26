@@ -29,7 +29,7 @@ from skyrl.backends.skyrl_train.distributed.megatron.quantization_utils import (
     resolve_auto_wire_format,
     validate_concrete_fp8_recipe,
 )
-from skyrl.backends.skyrl_train.utils.device import device_module
+from skyrl.backends.skyrl_train.utils.device import device_module, device_type
 from skyrl.backends.skyrl_train.utils.io.io import is_cloud_path
 from skyrl.backends.skyrl_train.weight_sync.fp8 import (
     AUTO_FP8,
@@ -1024,6 +1024,11 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
     # that previously ran successfully, so keeping this to maintain backwards compatibility.
     if cfg.generator.inference_engine.weight_sync_backend == "nccl":
         env_vars["NCCL_CUMEM_ENABLE"] = "0"
+
+    if device_type() == "xpu":
+        # With RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=1, Ray sets ONEAPI_DEVICE_SELECTOR="level_zero:" for every
+        # process with no GPU (eg: the entrypoint task). SYCL rejects that value and aborts the process.
+        env_vars["RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO"] = "0"
 
     if cfg.trainer.strategy == "megatron":
         # this is needed for megatron-core >= 0.15.0, which requires devices to be visible while importing megatron.core
