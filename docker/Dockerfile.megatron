@@ -1,4 +1,4 @@
-FROM anyscale/ray:2.57.0-py312-cu130
+FROM anyscale/ray:2.60.1-py312-cu130
 
 RUN sudo apt-get update -y && sudo apt-get install -y wget kmod libxml2 build-essential libnuma-dev
 
