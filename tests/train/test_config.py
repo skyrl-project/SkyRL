@@ -230,6 +230,18 @@ def test_trainer_config_rejects_invalid_vocab_entropy_chunking(field_name, value
         TrainerConfig(**{field_name: value})
 
 
+def test_trainer_config_hf_export_dtype():
+    assert TrainerConfig().hf_export_dtype is None
+    assert TrainerConfig(hf_export_dtype="bfloat16").hf_export_dtype == "bfloat16"
+    with pytest.raises(ValueError, match="hf_export_dtype"):
+        TrainerConfig(hf_export_dtype="bf16")
+
+
+def test_cli_override_sets_hf_export_dtype():
+    cfg = SkyRLTrainConfig.from_cli_overrides(["trainer.hf_export_dtype=float16"])
+    assert cfg.trainer.hf_export_dtype == "float16"
+
+
 def test_runtime_env_forwards_te_block_scale_mode(monkeypatch):
     monkeypatch.setenv("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", "1")
     monkeypatch.setattr(train_utils, "peer_access_supported", lambda **_kwargs: True)

@@ -762,7 +762,12 @@ class Worker(DistributedTorchRayActor):
             self.model,
             export_dir,
             tokenizer=tokenizer,
+            export_dtype=self._hf_export_dtype(),
         )
+
+    def _hf_export_dtype(self) -> Optional[torch.dtype]:
+        """``cfg.hf_export_dtype`` as a ``torch.dtype``, or None to keep the stored dtype."""
+        return getattr(torch, self.cfg.hf_export_dtype) if self.cfg.hf_export_dtype else None
 
     def get_lr(self) -> Optional[float]:
         """

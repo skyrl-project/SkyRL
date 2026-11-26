@@ -1099,6 +1099,7 @@ class MegatronWorker:
             tokenizer=tokenizer,
             distributed_save=hf_export.distributed_save,
             save_every_n_ranks=hf_export.save_every_n_ranks,
+            export_dtype=self._hf_export_dtype(),
         )
 
     def _get_module_for_offload(self):

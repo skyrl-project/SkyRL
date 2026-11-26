@@ -16,6 +16,8 @@ import tempfile
 import pytest
 import ray
 import torch
+from huggingface_hub import snapshot_download
+from safetensors.torch import load_file
 from transformers import AutoTokenizer
 
 from skyrl.train.config import SkyRLTrainConfig
@@ -36,6 +38,9 @@ def get_test_actor_config(strategy: str) -> SkyRLTrainConfig:
     cfg = SkyRLTrainConfig()
     cfg.trainer.policy.model.path = MODEL_NAME
     cfg.trainer.placement.policy_num_gpus_per_node = NUM_GPUS
+    # Only a policy worker group is created, with colocate_all=False; no inference engines are involved.
+    cfg.trainer.placement.colocate_all = False
+    cfg.trainer.placement.ref_num_gpus_per_node = NUM_GPUS
     cfg.trainer.strategy = strategy
 
     # Use temporary directories for testing
@@ -169,3 +174,57 @@ def test_save_load_hf_model(ray_init_fixture, strategy):
         for temp_dir in [cfg.trainer.ckpt_path, cfg.trainer.export_path, model_save_dir]:
             if temp_dir and os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir)
+
+
+@pytest.mark.parametrize(
+    ("strategy", "hf_export_dtype", "cpu_offload"),
+    [
+        ("fsdp", "bfloat16", False),
+        ("fsdp", "bfloat16", True),
+        pytest.param("megatron", "float32", False, marks=pytest.mark.megatron),
+    ],
+)
+def test_save_hf_model_export_dtype(ray_init_fixture, strategy, hf_export_dtype, cpu_offload):
+    """
+    ``trainer.hf_export_dtype`` sets the dtype of every exported floating-point tensor and of ``config.json``.
+
+    The model is exported right after init, with no training step, so each exported tensor must equal the
+    original checkpoint's tensor (bf16 on the Hub) cast to the export dtype: FSDP holds the weights as fp32
+    master copies, and fp32 -> bf16 of a bf16-representable value is exact; Megatron holds bf16, and the
+    cast up to fp32 is exact. ``cpu_offload`` covers FSDP2-native offload, where the shards live on CPU.
+    """
+    cfg = get_test_actor_config(strategy)
+    cfg.trainer.hf_export_dtype = hf_export_dtype
+    if cpu_offload:
+        cfg.trainer.policy.fsdp_config.cpu_offload = True
+    export_dtype = getattr(torch, hf_export_dtype)
+
+    try:
+        actor_group = init_worker_with_type(
+            "policy",
+            shared_pg=None,
+            colocate_all=False,
+            num_gpus_per_node=cfg.trainer.placement.policy_num_gpus_per_node,
+            cfg=cfg,
+        )
+        export_dir = os.path.join(cfg.trainer.export_path, "global_step_0", "policy")
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+        ray.get(
+            actor_group.async_run_ray_method(
+                "pass_through", "save_hf_model", export_dir=export_dir, tokenizer=tokenizer
+            )
+        )
+
+        with open(os.path.join(export_dir, "config.json")) as f:
+            assert json.load(f)["dtype"] == hf_export_dtype
+
+        original = load_file(os.path.join(snapshot_download(MODEL_NAME), "model.safetensors"))
+        exported = load_file(os.path.join(export_dir, "model.safetensors"))
+        assert exported, "export wrote no tensors"
+        assert set(exported) <= set(original), f"unexpected keys: {set(exported) - set(original)}"
+        for name, tensor in exported.items():
+            assert tensor.dtype == export_dtype, f"{name}: {tensor.dtype}"
+            torch.testing.assert_close(tensor, original[name].to(export_dtype), atol=0, rtol=0, msg=name)
+    finally:
+        shutil.rmtree(cfg.trainer.ckpt_path, ignore_errors=True)
+        shutil.rmtree(cfg.trainer.export_path, ignore_errors=True)

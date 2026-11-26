@@ -155,6 +155,19 @@ class TestTopLevelOverrides:
         skyrl_cfg = build_skyrl_config_for_sft(cfg)
         assert skyrl_cfg.trainer.policy.language_model_only is True
 
+    def test_hf_export_dtype_bridges_to_trainer(self):
+        skyrl_cfg = build_skyrl_config_for_sft(_sft_cfg_from_overrides([]))
+        assert skyrl_cfg.trainer.hf_export_dtype is None
+
+        cfg = _sft_cfg_from_overrides(["hf_save_interval=10", "hf_export_dtype=bfloat16"])
+        skyrl_cfg = build_skyrl_config_for_sft(cfg)
+        assert skyrl_cfg.trainer.hf_export_dtype == "bfloat16"
+
+    def test_invalid_hf_export_dtype_rejected(self):
+        cfg = _sft_cfg_from_overrides(["model.path=test/my-model", "num_steps=1", "hf_export_dtype=bf16"])
+        with pytest.raises(ValueError, match="hf_export_dtype"):
+            validate_sft_cfg(cfg)
+
     def test_fused_lm_head_logprob_bridges_to_trainer(self):
         skyrl_cfg = build_skyrl_config_for_sft(_sft_cfg_from_overrides([]))
         assert skyrl_cfg.trainer.fused_lm_head_logprob is False

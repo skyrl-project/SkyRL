@@ -206,6 +206,39 @@ def fsdp2_get_full_state_dict(model: torch.nn.Module, cpu_offload=True, rank0_on
     return state_dict
 
 
+def fsdp2_get_full_state_dict_in_dtype(model: torch.nn.Module, dtype: torch.dtype) -> dict:
+    """Full state dict on rank 0's CPU, with floating-point tensors cast to ``dtype`` on the GPU.
+
+    Unlike ``fsdp2_get_full_state_dict``, which copies the stored (e.g. fp32) tensors to CPU, this
+    gathers one tensor at a time, casts it on the GPU, and only then copies it to rank 0's CPU, so the
+    device-to-host copy and rank 0's host memory scale with ``dtype``. GPU memory holds one unsharded
+    tensor at a time. Must be called on all ranks; returns an empty dict on the other ranks.
+    """
+    from torch.distributed.checkpoint.state_dict import (
+        StateDictOptions,
+        get_model_state_dict,
+    )
+    from torch.distributed.tensor import DTensor
+
+    # Sharded state dict: same keys as the full one, but nothing is gathered or copied yet.
+    sharded = get_model_state_dict(model, options=StateDictOptions(full_state_dict=False, cpu_offload=False))
+    device = torch.device("cuda", torch.cuda.current_device())
+    is_rank_0 = dist.get_rank() == 0
+    state_dict = {}
+    for name, tensor in sharded.items():
+        if isinstance(tensor, DTensor):
+            # A CPU-offloaded model keeps its shards on CPU; the all-gather needs them on the GPU.
+            full = tensor.to(device).full_tensor()
+        else:
+            full = tensor.to(device)
+        if full.is_floating_point():
+            full = full.to(dtype)
+        if is_rank_0:
+            state_dict[name] = full.cpu()
+        del full
+    return state_dict
+
+
 def apply_fsdp2(model, fsdp_kwargs, config: Union[FSDPConfig, DictConfig]):
     """model: AutoModelForCausalLM"""
     assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"

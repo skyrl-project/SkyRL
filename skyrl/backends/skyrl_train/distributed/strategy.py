@@ -1,3 +1,4 @@
+import copy
 import random
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional, TypeVar, Union
@@ -52,8 +53,21 @@ class DistributedStrategy(ABC):
 
     @abstractmethod
     def save_hf_model(self, model, output_dir: str, tokenizer=None, **kwargs):
-        """Save model in HuggingFace safetensors format"""
+        """Save model in HuggingFace safetensors format.
+
+        Implementations accept ``export_dtype: Optional[torch.dtype]``: when set, floating-point weights
+        are cast to it and the saved ``config.json`` records it; ``None`` keeps the stored dtype.
+        """
         pass
+
+    @staticmethod
+    def config_with_export_dtype(config: PretrainedConfig, export_dtype: Optional[torch.dtype]) -> PretrainedConfig:
+        """Return ``config`` unchanged if ``export_dtype`` is None, else a copy whose ``dtype`` is ``export_dtype``."""
+        if export_dtype is None:
+            return config
+        config = copy.deepcopy(config)
+        config.dtype = export_dtype
+        return config
 
     def print(self, *msg):
         """Print only on rank 0"""

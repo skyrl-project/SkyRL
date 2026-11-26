@@ -204,7 +204,9 @@ each bin becomes one row of the dispatched batch and one worker micro-batch.
 - `resume_from` -- `""` (fresh), `"latest"`, or a path to a `global_step_N` dir.
 - `max_ckpts_to_keep` -- `-1` keeps all, `N` keeps only the last N.
 - `hf_save_interval` / `export_path` -- periodically export HuggingFace-format
-  weights (defaults to `{ckpt_path}/hf_exports`).
+  weights (defaults to `{ckpt_path}/hf_exports`). `hf_export_dtype` (`bfloat16`,
+  `float16` or `float32`) sets the dtype of the exported weights; the default keeps
+  the training storage dtype (fp32 for FSDP full fine-tuning).
 
 ## Evaluation
 

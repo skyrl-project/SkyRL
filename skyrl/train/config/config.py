@@ -22,6 +22,18 @@ from skyrl.train.fused_lm_head import FUSED_LM_HEAD_BACKENDS, FusedLmHeadBackend
 from skyrl_gym.envs.search.env import SearchEnvConfig
 from skyrl_gym.envs.sql.env import Text2SQLEnvConfig
 
+HFExportDtype = Literal["bfloat16", "float16", "float32"]
+"""Weight dtypes accepted by ``TrainerConfig.hf_export_dtype``; each is a ``torch`` dtype attribute name."""
+
+
+def validate_hf_export_dtype(hf_export_dtype: Optional[str]) -> None:
+    """Raise ``ValueError`` unless ``hf_export_dtype`` is ``None`` or one of ``HFExportDtype``."""
+    if hf_export_dtype not in (None, *typing.get_args(HFExportDtype)):
+        raise ValueError(
+            f"hf_export_dtype must be one of {typing.get_args(HFExportDtype)} or None, got {hf_export_dtype!r}."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Data
 # ---------------------------------------------------------------------------
@@ -1881,6 +1893,12 @@ class TrainerConfig(BaseConfig):
     """Path for exported artifacts (HF models, debug dumps, etc.).
     For sharded multi-node HF exports with ``policy.megatron_config.hf_export_config.distributed_save=True``, this must
     be a shared filesystem path visible to all Megatron ranks."""
+    hf_export_dtype: Optional[HFExportDtype] = None
+    """Dtype of the floating-point weights in HuggingFace exports (``hf_save_interval`` and ``save_hf_model``
+    calls), for the policy and the critic. The exported ``config.json`` records the same dtype.
+    ``None`` writes the weights in the dtype they are stored in during training: fp32 for FSDP full
+    fine-tuning (fp32 master weights), and bf16 for Megatron and for the frozen base of an FSDP LoRA policy
+    with ``bf16=True``. Casting up does not recover precision lost to a lower-precision training dtype."""
     bf16: bool = True
     """Load models in bf16. FSDP: the ref model and a LoRA policy's frozen base (the adapters stay fp32).
     Megatron: the policy and ref models, including LoRA adapters. ``False`` uses fp32."""
@@ -2060,6 +2078,8 @@ class TrainerConfig(BaseConfig):
                 "`trainer.policy.megatron_config.lora_config.merge_lora=False` so weight "
                 "sync preserves the inference engine's INT4 base weights."
             )
+
+        validate_hf_export_dtype(self.hf_export_dtype)
 
         if self.logprobs_chunk_size is not None and (
             not isinstance(self.logprobs_chunk_size, int) or self.logprobs_chunk_size <= 0

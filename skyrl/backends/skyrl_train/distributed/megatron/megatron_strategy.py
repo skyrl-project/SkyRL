@@ -757,8 +757,17 @@ class MegatronStrategy(DistributedStrategy):
         *,
         distributed_save: bool = False,
         save_every_n_ranks: int = 1,
+        export_dtype: Optional[torch.dtype] = None,
         **kwargs,
     ) -> None:
+        """Save the Megatron model as a HuggingFace checkpoint through Megatron-Bridge.
+
+        Args:
+            export_dtype: Passed to ``save_hf_weights`` as ``weight_dtype``: floating-point weights are cast
+                to it and ``config.json`` records it. For a model whose HF checkpoint is quantized (FP8 /
+                MXFP4 with scale tensors), the bridge then writes plain dequantized weights instead of the
+                quantized layout. ``None`` keeps the bridge default.
+        """
         if distributed_save and io.is_cloud_path(output_dir):
             raise ValueError(
                 f"distributed_save=True is incompatible with cloud paths (got {output_dir}). "
@@ -785,6 +794,7 @@ class MegatronStrategy(DistributedStrategy):
                 strict=False,
                 distributed_save=distributed_save,
                 save_every_n_ranks=save_every_n_ranks,
+                weight_dtype=export_dtype,
             )
             self.print(f"Successfully saved HF safetensors model to {output_dir}")
 
@@ -798,7 +808,7 @@ class MegatronStrategy(DistributedStrategy):
                 # custom Python modules and other artifacts that
                 # save_pretrained() alone does not emit.
                 bridge.hf_pretrained.save_artifacts(work_dir)
-                self.save_hf_configs(self.hf_config, work_dir, tokenizer)
+                self.save_hf_configs(self.config_with_export_dtype(self.hf_config, export_dtype), work_dir, tokenizer)
                 self.print(f"Successfully saved HF config and tokenizer to {output_dir}")
 
         dist.barrier()

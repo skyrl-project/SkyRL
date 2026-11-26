@@ -23,7 +23,11 @@ from skyrl.train.config import (
     SkyRLTrainConfig,
     TorchProfilerConfig,
 )
-from skyrl.train.config.config import overrides_dict_to_dotlist
+from skyrl.train.config.config import (
+    HFExportDtype,
+    overrides_dict_to_dotlist,
+    validate_hf_export_dtype,
+)
 
 # ---------------------------------------------------------------------------
 # TrainOnWhat enum
@@ -255,6 +259,9 @@ class SFTConfig(BaseConfig):
     """Save HuggingFace-format weights every N steps. 0 = disabled."""
     export_path: str = ""
     """Directory for HF-format exports. Defaults to ckpt_path/hf_exports if empty."""
+    hf_export_dtype: Optional[HFExportDtype] = None
+    """Dtype of the floating-point weights in HF exports. ``None`` keeps the training storage dtype
+    (fp32 for FSDP full fine-tuning). See ``TrainerConfig.hf_export_dtype``."""
 
     seed: int = 42
 
@@ -573,6 +580,7 @@ def validate_sft_cfg(cfg: SFTConfig) -> None:
             raise ValueError(f"num_epochs must be > 0, got {cfg.num_epochs}")
     if not cfg.model.path:
         raise ValueError("model.path must be set")
+    validate_hf_export_dtype(cfg.hf_export_dtype)
     if cfg.dummy_run_full_ctx and cfg.dummy_run_max_steps <= 0:
         raise ValueError(f"dummy_run_max_steps must be > 0, got {cfg.dummy_run_max_steps}")
     if cfg.max_training_steps is not None and cfg.max_training_steps <= 0:
@@ -720,6 +728,7 @@ def build_skyrl_config_for_sft(sft_cfg: SFTConfig) -> SkyRLTrainConfig:
         cfg.trainer.ckpt_interval = sft_cfg.ckpt_interval
 
     # HF export
+    cfg.trainer.hf_export_dtype = sft_cfg.hf_export_dtype
     if sft_cfg.hf_save_interval > 0:
         cfg.trainer.hf_save_interval = sft_cfg.hf_save_interval
         if sft_cfg.export_path:

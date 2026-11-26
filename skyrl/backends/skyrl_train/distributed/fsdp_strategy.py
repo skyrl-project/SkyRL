@@ -27,6 +27,7 @@ from skyrl.backends.skyrl_train.distributed.fsdp_utils import (
     create_device_mesh,
     fsdp2_clip_grad_norm_,
     fsdp2_get_full_state_dict,
+    fsdp2_get_full_state_dict_in_dtype,
     fsdp2_load_full_state_dict,
     load_fsdp2_model_to_gpu,
     load_fsdp_optimizer,
@@ -554,8 +555,21 @@ class FSDPStrategy(DistributedStrategy):
         return ckpt_dir, states
 
     # TODO (erictang000): Test in multi-node setting
-    def save_hf_model(self, model: Union[HFModelWrapper, nn.Module], output_dir: str, tokenizer=None, **kwargs) -> None:
-        """Save model in HuggingFace safetensors format using FSDP's full state dict gathering"""
+    def save_hf_model(
+        self,
+        model: Union[HFModelWrapper, nn.Module],
+        output_dir: str,
+        tokenizer=None,
+        export_dtype: Optional[torch.dtype] = None,
+        **kwargs,
+    ) -> None:
+        """Save model in HuggingFace safetensors format using FSDP's full state dict gathering.
+
+        Args:
+            export_dtype: If set, floating-point tensors are cast to this dtype before writing and
+                ``config.json`` records it. ``None`` writes the stored parameter dtype.
+            **kwargs: Forwarded to ``save_pretrained``.
+        """
 
         # Step 1: Create output directory (rank 0 only)
         if self.is_rank_0():
@@ -571,7 +585,11 @@ class FSDPStrategy(DistributedStrategy):
             raise ValueError("Model must be a HuggingFace model with config and save_pretrained method")
 
         # Step 3: Collect full state dict on rank 0 only
-        output_state_dict = fsdp2_get_full_state_dict(fsdp_model, cpu_offload=True, rank0_only=True)
+        if export_dtype is None:
+            output_state_dict = fsdp2_get_full_state_dict(fsdp_model, cpu_offload=True, rank0_only=True)
+        else:
+            # Cast on the GPU before the copy to CPU, so a bf16 export moves half the bytes of fp32.
+            output_state_dict = fsdp2_get_full_state_dict_in_dtype(fsdp_model, export_dtype)
 
         # Step 4: Save on rank 0 only
         if self.is_rank_0():
@@ -580,7 +598,9 @@ class FSDPStrategy(DistributedStrategy):
                 model_to_save.save_pretrained(work_dir, state_dict=output_state_dict, safe_serialization=True, **kwargs)
 
                 # Fix and save the config
-                config_to_save = self._fix_fsdp_config(model_to_save.config)
+                config_to_save = self.config_with_export_dtype(
+                    self._fix_fsdp_config(model_to_save.config), export_dtype
+                )
                 config_to_save.save_pretrained(work_dir)
 
                 # Save tokenizer if provided

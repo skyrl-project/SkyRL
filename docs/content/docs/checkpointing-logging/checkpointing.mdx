@@ -148,6 +148,19 @@ In addition to checkpointing, users can optionally save the policy model in Hugg
   - **Purpose**: Base directory where HuggingFace models and other artifacts are saved
   - **Structure**: Models are saved to `{export_path}/global_step_{N}/policy/`
 
+`hf_export_dtype`
+  - **Default**: `null` (keep the dtype the weights are stored in during training)
+  - **Purpose**: Dtype of the floating-point weights in the export (policy and critic); `config.json` records the same dtype
+  - **Options**: `null`, `"bfloat16"`, `"float16"`, `"float32"`
+
+With `null`, FSDP full fine-tuning exports its fp32 master weights, while Megatron (and the frozen base of an FSDP
+LoRA policy with `trainer.bf16=true`) exports bf16. For FSDP full fine-tuning, `hf_export_dtype="bfloat16"` halves the
+export size, and since each tensor is cast on the GPU before it is copied to rank 0's CPU, it also halves the
+device-to-host traffic and rank 0's host memory for the export; a model loaded from the export for further training starts from the bf16
+weights. Casting up (e.g. `"float32"` on Megatron) does not recover precision lost to a lower-precision training
+dtype. On Megatron, models whose HuggingFace checkpoint is quantized (FP8 / MXFP4 with scale tensors) are exported as
+plain dequantized weights when `hf_export_dtype` is set, instead of in the quantized layout.
+
 ### Distributed HuggingFace Export (Megatron)
 
 By default the Megatron-to-HuggingFace safetensors export is written entirely from rank 0. For
