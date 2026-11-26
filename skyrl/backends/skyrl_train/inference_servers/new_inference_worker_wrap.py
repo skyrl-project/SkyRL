@@ -198,6 +198,15 @@ from skyrl.backends.skyrl_train.patches.vllm.patch_pp_kv_cache_projection import
 
 apply_pp_kv_cache_projection_patch()
 
+# AMD ROCm: a router gate with an fp32 weight (NemotronH) keeps a split copy of it that vLLM's layerwise
+# reload cannot restore, so the first weight sync fails. No-op off ROCm. Installed here because the gate
+# decides at model init.
+from skyrl.backends.skyrl_train.patches.vllm.patch_rocm_router_bf16x3 import (  # noqa: E402
+    apply_rocm_router_bf16x3_patch,
+)
+
+apply_rocm_router_bf16x3_patch()
+
 
 VLLM_NEW_INFERENCE_WORKER_EXTENSION_CLS = f"{__name__}.NewInferenceWorkerWrap"
 
