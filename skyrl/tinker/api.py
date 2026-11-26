@@ -5,6 +5,7 @@ import random
 import re
 import shutil
 import signal
+import sys
 import threading
 from contextlib import asynccontextmanager, nullcontext, suppress
 from datetime import datetime, timedelta, timezone
@@ -230,8 +231,14 @@ async def _close_external_inference(app: FastAPI) -> None:
 
 
 def _should_forward_sample_requests(config: EngineConfig) -> bool:
-    """Return whether samples can bypass the engine for managed inference."""
+    """Return whether samples can bypass the engine for managed inference.
+
+    IsoExec's backend records each sample's logprobs to compare them in the
+    later forward_backward, so every sample has to go through it.
+    """
     if config.backend not in ("megatron", "fsdp") or config.runtime_role != "combined":
+        return False
+    if (config.backend_config or {}).get("isoexec") is not None:
         return False
     backend_config = flatten_backend_config(config.backend_config or {})
     return not bool(backend_config.get("trainer.placement.colocate_all", True))
@@ -298,8 +305,12 @@ def _build_uv_run_cmd_engine(parent_cmd: list[str], engine_config: BaseModel) ->
     parent_flags = _get_parent_uv_run_args(parent_cmd)
     logger.debug(f"Detected API server uv run flags: {parent_flags}")
     cmd.extend(parent_flags)
-    # NOTE: uv deduplicates extras so we can unconditionally add the tinker extra
-    cmd.extend(["--extra", "tinker", "--extra", engine_config.backend])
+    if "--no-project" in parent_flags:
+        # uv ignores --extra without a project, so the engine runs on the API's own interpreter.
+        cmd.append(sys.executable)
+    else:
+        # NOTE: uv deduplicates extras so we can unconditionally add the tinker extra
+        cmd.extend(["--extra", "tinker", "--extra", engine_config.backend])
     cmd.extend(["-m", "skyrl.tinker.engine"])
     cmd.extend(config_to_argv(engine_config))
     return cmd

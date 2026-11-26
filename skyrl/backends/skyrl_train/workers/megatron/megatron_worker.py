@@ -245,6 +245,8 @@ def default_cp_comm_type_for_sliding_window(config) -> None:
 
 
 class MegatronWorker:
+    # Strategy built in init_worker_process_group; can be overridden by subclasses.
+    strategy_cls = MegatronStrategy
     _mfu_warned = False
 
     def _maybe_setup_fake_int4_qat(self):
@@ -955,6 +957,13 @@ class MegatronWorker:
                     **vlm_inputs,
                 }
             )
+            if micro.get("rollout_full_logprobs") is not None:
+                micro_dicts[-1].update(
+                    rollout_full_logprobs=micro["rollout_full_logprobs"],
+                    rollout_logprobs=micro["rollout_logprobs"],
+                    loss_mask=micro["loss_mask"],
+                    sample_indices=micro["sample_indices"],
+                )
 
         if use_token_batching:
             # Pad microbatches to uniform batch size for Megatron compatibility
@@ -1181,7 +1190,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             torch.distributed.broadcast = _broadcast_no_grad
             torch.distributed._skyrl_broadcast_no_grad_patched = True
 
-        self.strategy = MegatronStrategy(
+        self.strategy = self.strategy_cls(
             megatron_config=self.cfg.policy.megatron_config,
             optimizer_config=self.cfg.policy.optimizer_config,
             seed=self.cfg.seed,
@@ -1287,16 +1296,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 cpu_threads = len(os.sched_getaffinity(0)) // max(1, self.cfg.placement.policy_num_gpus_per_node)
                 if torch.get_num_threads() < cpu_threads:
                     torch.set_num_threads(cpu_threads)
-            optim_config = init_megatron_optim_config(
-                self.cfg.policy.optimizer_config, self.cfg.policy.megatron_config.optimizer_config_kwargs
-            )
-            offload_cfg = self.cfg.policy.megatron_config.optimizer_offload_to_disk
-            offload_to_disk = None
-            if offload_cfg.dir is not None:
-                if self._is_lora:
-                    raise ValueError("optimizer_offload_to_disk does not support LoRA.")
-                offload_to_disk = dataclasses.replace(offload_cfg, dir=os.path.join(offload_cfg.dir, self.cfg.run_name))
-            self.optimizer = get_megatron_optimizer(self.actor_module, optim_config, offload_to_disk=offload_to_disk)
+            self.optimizer = self._build_optimizer()
 
             # create scheduler
             self.scheduler = get_megatron_optimizer_param_scheduler(
@@ -1317,13 +1317,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 )
 
         # create worker model
-        self.model = MegatronModelWrapper(
-            config=self.cfg,
-            actor_module=self.actor_module,
-            actor_optimizer=self.optimizer,
-            policy_loss_fn=self.policy_loss_fn,
-            is_vlm=self.is_vlm,
-        )
+        self.model = self._build_model_wrapper()
 
         megatron_config = self.cfg.policy.megatron_config
         expandable_segments = self.cfg.use_expandable_segments
@@ -1333,6 +1327,35 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         # Enable expandable_segments after init so model weights stay in IPC-compatible
         # standard CUDA memory; only subsequent activations use expandable segments.
         self._set_expandable_segments(True)
+
+    def _build_optimizer(self):
+        """Create the policy optimizer over ``self.actor_module``.
+
+        Subclasses can override this to supply a different optimizer.
+        """
+        optim_config = init_megatron_optim_config(
+            self.cfg.policy.optimizer_config, self.cfg.policy.megatron_config.optimizer_config_kwargs
+        )
+        offload_cfg = self.cfg.policy.megatron_config.optimizer_offload_to_disk
+        offload_to_disk = None
+        if offload_cfg.dir is not None:
+            if self._is_lora:
+                raise ValueError("optimizer_offload_to_disk does not support LoRA.")
+            offload_to_disk = dataclasses.replace(offload_cfg, dir=os.path.join(offload_cfg.dir, self.cfg.run_name))
+        return get_megatron_optimizer(self.actor_module, optim_config, offload_to_disk=offload_to_disk)
+
+    def _build_model_wrapper(self) -> MegatronModelWrapper:
+        """Create the ``MegatronModelWrapper`` over ``self.actor_module`` and ``self.optimizer``.
+
+        Subclasses can override this to supply a ``MegatronModelWrapper`` subclass.
+        """
+        return MegatronModelWrapper(
+            config=self.cfg,
+            actor_module=self.actor_module,
+            actor_optimizer=self.optimizer,
+            policy_loss_fn=self.policy_loss_fn,
+            is_vlm=self.is_vlm,
+        )
 
     def forward(
         self,
@@ -2374,7 +2397,7 @@ class MegatronRefWorkerBase(MegatronWorker, RefWorkerBase):
                 backend="cpu:gloo,cuda:nccl", timeout=timedelta(seconds=SKYRL_WORKER_NCCL_TIMEOUT_IN_S)
             )
 
-        self.strategy = MegatronStrategy(
+        self.strategy = self.strategy_cls(
             megatron_config=self.cfg.ref.megatron_config,
             optimizer_config=None,
             seed=self.cfg.seed,
@@ -2434,11 +2457,19 @@ class MegatronRefWorkerBase(MegatronWorker, RefWorkerBase):
             print_model_size(self.actor_module[0])
 
         # create worker model
-        # Propagate is_vlm so ref forwards apply the same VLM image handling and
-        # parallelism guards as the policy worker.
-        self.model = MegatronModelWrapper(config=self.cfg, actor_module=self.actor_module, is_vlm=self.is_vlm)
+        self.model = self._build_model_wrapper()
 
         self._set_expandable_segments(True)
+
+    def _build_model_wrapper(self) -> MegatronModelWrapper:
+        """Create the ``MegatronModelWrapper`` over ``self.actor_module``. The ref has no optimizer.
+
+        Propagates is_vlm so ref forwards apply the same VLM image handling and
+        parallelism guards as the policy worker.
+
+        Subclasses can override this to supply a ``MegatronModelWrapper`` subclass.
+        """
+        return MegatronModelWrapper(config=self.cfg, actor_module=self.actor_module, is_vlm=self.is_vlm)
 
     def _set_pad_token_id(self, pad_token_id):
         # this already gets set in the init_model method

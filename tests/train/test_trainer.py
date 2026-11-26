@@ -2,6 +2,8 @@
 uv  run --isolated --extra dev pytest tests/train/test_trainer.py
 """
 
+import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -282,6 +284,87 @@ def test_calc_advantages_and_returns_step_wise_broadcast(dummy_config):
     )
     assert torch.allclose(data["advantages"], expected_advantages)
     assert torch.allclose(data["returns"], expected_advantages)
+
+
+def test_rollout_full_logprobs_go_to_the_policy_forward_only(dummy_config, monkeypatch):
+    """With ``isoexec`` set, only the policy forward gets ``rollout_full_logprobs``, IsoExec is called
+    before and after it, and ``training_input`` no longer holds the rows afterwards."""
+    calls = []
+
+    def before_policy_forward(isoexec, training_input, data_fwd_pass, *, global_step):
+        calls.append("before")
+
+    def after_policy_forward(training_input, data_fwd_pass, action_log_probs):
+        calls.append("after")
+        return {}
+
+    # isoexec is not installed in SkyRL's test environment.
+    monkeypatch.setitem(
+        sys.modules,
+        "isoexec.integrations.skyrl.audit",
+        SimpleNamespace(before_policy_forward=before_policy_forward, after_policy_forward=after_policy_forward),
+    )
+    dummy_config.isoexec = {"model_package": "unused"}
+    dummy_config.trainer.critic.model.path = "dummy"  # so that the critic forward runs
+    trainer = RayPPOTrainer(
+        cfg=dummy_config,
+        tracker=None,
+        tokenizer=None,
+        train_dataset=DummyDataset(),
+        eval_dataset=None,
+        inference_engine_client=None,
+        generator=None,
+    )
+    trainer.dispatch = MagicMock()
+    trainer.ref_model = MagicMock()  # so that the ref forward runs
+
+    batch_size, seq_len, response_len, vocab_size = 2, 5, 3, 7
+    training_input = TrainingInputBatch(
+        {
+            "sequences": torch.zeros(batch_size, seq_len, dtype=torch.long),
+            "attention_mask": torch.ones(batch_size, seq_len, dtype=torch.long),
+            "loss_mask": torch.ones(batch_size, response_len, dtype=torch.long),
+            "rollout_logprobs": torch.zeros(batch_size, response_len),
+            "rollout_full_logprobs": torch.zeros(batch_size, response_len, vocab_size),
+        }
+    )
+    training_input.metadata = {"response_length": response_len}
+
+    forward_keys = {}
+
+    def record_forward_keys(model, data_fwd_pass, key, mini_batch_boundaries):
+        calls.append(model)
+        forward_keys[model] = set(data_fwd_pass.keys())
+        return torch.zeros(batch_size, response_len)
+
+    monkeypatch.setattr(trainer, "_execute_forward_pass", record_forward_keys)
+
+    training_input = trainer.fwd_logprobs_values_reward(training_input)
+
+    assert calls == ["critic", "ref", "before", "policy", "after"]
+    assert "rollout_full_logprobs" not in forward_keys["critic"]
+    assert "rollout_full_logprobs" not in forward_keys["ref"]
+    assert {"rollout_full_logprobs", "rollout_logprobs", "loss_mask", "sample_indices"} <= forward_keys["policy"]
+    assert "rollout_full_logprobs" not in training_input
+
+
+def test_policy_forward_is_not_skipped_when_isoexec_is_set(dummy_config):
+    """A loss that lets the policy forward be skipped still runs it when ``isoexec`` is set."""
+    dummy_config.trainer.algorithm.policy_loss_type = "dppo"
+    trainer = RayPPOTrainer(
+        cfg=dummy_config,
+        tracker=None,
+        tokenizer=None,
+        train_dataset=DummyDataset(),
+        eval_dataset=None,
+        inference_engine_client=None,
+        generator=None,
+    )
+    training_input = TrainingInputBatch({"rollout_logprobs": torch.zeros(2, 3)})
+
+    assert trainer._skip_policy_forward(training_input)
+    trainer.cfg.isoexec = {"model_package": "unused"}
+    assert not trainer._skip_policy_forward(training_input)
 
 
 def test_flush_pending_metrics_logs_and_clears(dummy_config):
