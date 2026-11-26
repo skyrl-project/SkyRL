@@ -435,24 +435,102 @@ class TorchProfilerConfig(BaseConfig):
             )
 
 
+VALID_LORA_EXPORT_FORMATS = ("merged", "adapter", "both")
+
+
 @dataclass
 class MegatronHFExportConfig(BaseConfig):
     distributed_save: bool = False
     """Fan the Megatron->HF safetensors export across ranks instead of writing it all from rank 0.
 
     The on-disk result is the standard HF sharded format either way; this only parallelizes the
-    write. Only affects HF exports from ``hf_save_interval`` or explicit ``save_hf_model`` calls.
-    Sharded multi-node exports require ``trainer.export_path`` to be a shared filesystem path
-    visible to every rank; see https://docs.skyrl.ai/docs/checkpointing-logging/checkpointing."""
+    write. Only affects merged HF exports from ``hf_save_interval`` or explicit ``save_hf_model``
+    calls. Sharded multi-node exports require ``trainer.export_path`` to be a shared filesystem
+    path visible to every rank; see https://docs.skyrl.ai/docs/checkpointing-logging/checkpointing."""
     save_every_n_ranks: int = 1
     """In distributed save, only ranks 0, N, 2N, ... write shards (e.g. 8 = one writer per 8-GPU node).
     Must be at least 1. Ignored when ``distributed_save`` is False."""
+    lora_export_format: Literal["merged", "adapter", "both"] = "merged"
+    """Export format for LoRA policies when writing HuggingFace exports (``hf_save_interval`` or
+    explicit ``save_hf_model``).
+
+    - ``"merged"`` (default): merge LoRA adapters into the base model and write a full HF checkpoint
+      to the export directory.
+    - ``"adapter"``: write only a HuggingFace PEFT adapter (``adapter_config.json``,
+      ``adapter_model.safetensors``, and tokenizer if provided) to the export directory via
+      Megatron-Bridge's ``AutoBridge.save_hf_adapter``.
+    - ``"both"``: write the merged HF model to the export directory and the PEFT adapter to
+      ``<export_dir>/lora_adapter/``.
+
+    ``"adapter"`` and ``"both"`` require ``trainer.strategy="megatron"`` and LoRA
+    (``policy.model.lora.rank > 0``). For checkpoints with packed HF expert weights
+    (``experts.gate_up_proj`` / ``experts.down_proj``), targeting routed experts requires
+    ``moe_grouped_gemm=True`` and ``lora_config.experts_shared_outer_loras=False``."""
+    expand_shared_outer: bool = False
+    """Passed to ``AutoBridge.save_hf_adapter`` for shared-outer MoE LoRA
+    (``lora_config.experts_shared_outer_loras=True``): replicate the shared factor across experts
+    under per-expert names so ``PeftModel.from_pretrained`` can load the exported adapter.
+    Supported for per-expert HF layouts only; checkpoints with packed HF expert weights
+    (``experts.gate_up_proj`` / ``experts.down_proj``) are rejected at worker init.
+    Mutually exclusive with ``allow_serving_layout``; only valid with
+    ``lora_export_format`` set to ``"adapter"`` or ``"both"``."""
+    allow_serving_layout: bool = False
+    """Passed to ``AutoBridge.save_hf_adapter`` for shared-outer MoE LoRA
+    (``lora_config.experts_shared_outer_loras=True``): write the compact serving layout (the shared
+    factor once as ``[1, ...]`` next to its per-expert partner) instead of raising. Not loadable by
+    ``PeftModel.from_pretrained``. Supported for per-expert HF layouts only; checkpoints with packed
+    HF expert weights (``experts.gate_up_proj`` / ``experts.down_proj``) are rejected at worker init.
+    Mutually exclusive with ``expand_shared_outer``; only valid with
+    ``lora_export_format`` set to ``"adapter"`` or ``"both"``."""
 
     def __post_init__(self) -> None:
         # save_every_n_ranks indexes ranks via modulo/floor-div in the bridge's
         # distributed save; < 1 raises ZeroDivisionError there. Fail fast instead.
         if self.save_every_n_ranks < 1:
             raise ValueError(f"save_every_n_ranks must be >= 1, got {self.save_every_n_ranks}")
+        if self.lora_export_format not in VALID_LORA_EXPORT_FORMATS:
+            raise ValueError(
+                f"lora_export_format must be one of {VALID_LORA_EXPORT_FORMATS}, got {self.lora_export_format!r}"
+            )
+        if self.expand_shared_outer and self.allow_serving_layout:
+            raise ValueError("expand_shared_outer and allow_serving_layout cannot both be True.")
+        if (self.expand_shared_outer or self.allow_serving_layout) and self.lora_export_format == "merged":
+            raise ValueError(
+                "expand_shared_outer and allow_serving_layout require lora_export_format to be 'adapter' or 'both'."
+            )
+
+    def validate(
+        self,
+        *,
+        strategy: str,
+        lora_rank: int,
+        experts_shared_outer_loras: bool = False,
+        update_ref_every_epoch: bool = False,
+        strategy_field: str = "trainer.strategy",
+    ) -> None:
+        self.__post_init__()
+        if self.lora_export_format == "merged":
+            return
+        if strategy != "megatron":
+            raise ValueError(
+                f"LoRA adapter HF export (lora_export_format={self.lora_export_format!r}) "
+                f"currently requires {strategy_field}='megatron'."
+            )
+        if lora_rank <= 0:
+            raise ValueError(
+                f"hf_export_config.lora_export_format={self.lora_export_format!r} requires LoRA (lora.rank > 0)."
+            )
+        if update_ref_every_epoch and self.lora_export_format == "adapter":
+            raise ValueError(
+                "trainer.update_ref_every_epoch=True requires full HF model exports and is incompatible with "
+                "lora_export_format='adapter' (use 'merged' or 'both')."
+            )
+        if experts_shared_outer_loras and not self.expand_shared_outer and not self.allow_serving_layout:
+            raise ValueError(
+                "LoRA adapter HF export with experts_shared_outer_loras=True requires either "
+                "hf_export_config.expand_shared_outer=True (PEFT-loadable per-expert layout) or "
+                "hf_export_config.allow_serving_layout=True (compact serving-only layout)."
+            )
 
 
 @dataclass

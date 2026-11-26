@@ -16,6 +16,7 @@ from skyrl.train.config.config import (
     BaseConfig,
     DeltaWeightSyncConfig,
     MegatronConfig,
+    MegatronHFExportConfig,
     PolicyConfig,
     SkyRLTrainConfig,
     TrainerConfig,
@@ -29,6 +30,7 @@ from skyrl.train.utils.utils import (
     _validate_expert_nvfp4_cfg,
     prepare_runtime_environment,
     validate_cfg,
+    validate_hf_export_cfg,
     validate_inference_engine_cfg,
     validate_megatron_cfg,
     validate_optimizer_offload_to_disk_cfg,
@@ -2136,3 +2138,103 @@ def test_runtime_environment_has_no_nvfp4_env_without_expert_nvfp4(monkeypatch):
     cfg = _make_validated_test_config()
     cfg.trainer.strategy = "megatron"
     assert _nvfp4_env(prepare_runtime_environment(cfg)) == {}
+
+
+def test_megatron_hf_export_config_defaults_and_invariants():
+    cfg = MegatronHFExportConfig()
+    assert cfg.lora_export_format == "merged"
+    assert cfg.expand_shared_outer is False
+    assert cfg.allow_serving_layout is False
+
+    for fmt in ("merged", "adapter", "both"):
+        assert MegatronHFExportConfig(lora_export_format=fmt).lora_export_format == fmt
+
+    with pytest.raises(ValueError, match="lora_export_format must be one of"):
+        MegatronHFExportConfig(lora_export_format="peft")
+
+    with pytest.raises(ValueError, match="cannot both be True"):
+        MegatronHFExportConfig(lora_export_format="adapter", expand_shared_outer=True, allow_serving_layout=True)
+
+    with pytest.raises(ValueError, match="require lora_export_format to be 'adapter' or 'both'"):
+        MegatronHFExportConfig(lora_export_format="merged", expand_shared_outer=True)
+
+    with pytest.raises(ValueError, match="require lora_export_format to be 'adapter' or 'both'"):
+        MegatronHFExportConfig(lora_export_format="merged", allow_serving_layout=True)
+
+
+def test_megatron_hf_export_config_cli_overrides():
+    cfg = SkyRLTrainConfig.from_cli_overrides(
+        [
+            "trainer.strategy=megatron",
+            "trainer.policy.model.lora.rank=8",
+            "trainer.policy.megatron_config.hf_export_config.lora_export_format=both",
+            "trainer.policy.megatron_config.hf_export_config.expand_shared_outer=true",
+        ]
+    )
+    hf_export = cfg.trainer.policy.megatron_config.hf_export_config
+    assert hf_export.lora_export_format == "both"
+    assert hf_export.expand_shared_outer is True
+    assert hf_export.allow_serving_layout is False
+
+
+@pytest.mark.parametrize("fmt", ["adapter", "both"])
+def test_validate_cfg_rejects_fsdp_lora_adapter_hf_export(fmt):
+    cfg = _make_validated_test_config()
+    cfg.trainer.strategy = "fsdp"
+    cfg.trainer.policy.model.lora.rank = 8
+    cfg.trainer.policy.megatron_config.hf_export_config.lora_export_format = fmt
+
+    with pytest.raises(ValueError, match=r"trainer\.strategy='megatron'"):
+        validate_cfg(cfg)
+
+
+@pytest.mark.parametrize(
+    "overrides, match",
+    [
+        ({"trainer.strategy": "fsdp"}, r"trainer\.strategy='megatron'"),
+        ({"trainer.policy.model.lora.rank": 0}, "requires LoRA"),
+        ({"trainer.update_ref_every_epoch": True}, "update_ref_every_epoch"),
+        ({"trainer.ref.megatron_config.hf_export_config.lora_export_format": "adapter"}, "policy only"),
+        ({"trainer.policy.megatron_config.lora_config.experts_shared_outer_loras": True}, "expand_shared_outer"),
+    ],
+)
+def test_hf_export_cfg_rejects_invalid_combinations(overrides, match):
+    cfg = _make_validated_test_config()
+    cfg.trainer.strategy = "megatron"
+    cfg.trainer.policy.model.lora.rank = 8
+    cfg.trainer.policy.megatron_config.hf_export_config.lora_export_format = "adapter"
+    for path, value in overrides.items():
+        *parents, name = path.split(".")
+        setattr(_get_nested_attr(cfg, ".".join(parents)), name, value)
+
+    with pytest.raises(ValueError, match=match):
+        validate_hf_export_cfg(cfg)
+
+
+@pytest.mark.parametrize("fmt", ["merged", "adapter", "both"])
+def test_validate_cfg_accepts_megatron_lora_hf_export_formats(fmt):
+    cfg = _make_validated_test_config()
+    cfg.trainer.strategy = "megatron"
+    cfg.trainer.policy.model.lora.rank = 8
+    cfg.trainer.policy.megatron_config.hf_export_config.lora_export_format = fmt
+    validate_cfg(cfg)
+
+
+@pytest.mark.parametrize("flag", ["expand_shared_outer", "allow_serving_layout"])
+def test_hf_export_cfg_accepts_shared_outer_with_layout_choice(flag):
+    cfg = _make_validated_test_config()
+    cfg.trainer.strategy = "megatron"
+    cfg.trainer.policy.model.lora.rank = 8
+    cfg.trainer.policy.megatron_config.lora_config.experts_shared_outer_loras = True
+    cfg.trainer.policy.megatron_config.hf_export_config.lora_export_format = "adapter"
+    setattr(cfg.trainer.policy.megatron_config.hf_export_config, flag, True)
+    validate_hf_export_cfg(cfg)
+
+
+def test_hf_export_cfg_allows_update_ref_every_epoch_with_both():
+    cfg = _make_validated_test_config()
+    cfg.trainer.strategy = "megatron"
+    cfg.trainer.policy.model.lora.rank = 8
+    cfg.trainer.update_ref_every_epoch = True
+    cfg.trainer.policy.megatron_config.hf_export_config.lora_export_format = "both"
+    validate_hf_export_cfg(cfg)

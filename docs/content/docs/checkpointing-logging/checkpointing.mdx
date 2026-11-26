@@ -173,3 +173,27 @@ across per-rank local work directories, and Megatron-Bridge builds `model.safete
 from the shard files visible to rank 0 — so the index comes out incomplete if rank 0 cannot see
 every shard written by the other ranks.
 </Callout>
+
+### LoRA PEFT Adapter Export (Megatron)
+
+For a LoRA policy (`trainer.policy.model.lora.rank > 0`) on `trainer.strategy=megatron`, HF exports
+default to merging the LoRA weights into the base model. Set `lora_export_format` to export a
+HuggingFace PEFT adapter (`adapter_config.json` and `adapter_model.safetensors`, loadable with
+`PeftModel.from_pretrained` or serving engines with `--enable-lora`) instead of or alongside the
+merged weights.
+
+`trainer.policy.megatron_config.hf_export_config.lora_export_format`
+  - **Default**: `"merged"`
+  - **Options**:
+    - `"merged"`: merge LoRA weights into the base model and save a full HF checkpoint to `{export_path}/global_step_{N}/policy/`
+    - `"adapter"`: write only the PEFT adapter (and tokenizer) to `{export_path}/global_step_{N}/policy/`
+    - `"both"`: write the merged HF model to `{export_path}/global_step_{N}/policy/` and the PEFT adapter to `{export_path}/global_step_{N}/policy/lora_adapter/`
+  - **Packed-expert note**: for checkpoints with packed HF expert weights (`experts.gate_up_proj` / `experts.down_proj`), exporting adapters that target routed experts requires `moe_grouped_gemm=true` and `lora_config.experts_shared_outer_loras=false`.
+
+`trainer.policy.megatron_config.hf_export_config.expand_shared_outer`
+  - **Default**: `false`
+  - **Purpose**: For shared-outer MoE LoRA (`lora_config.experts_shared_outer_loras=true`), replicate the shared factor across experts under per-expert names so `PeftModel.from_pretrained` can load the adapter. Per-expert HF layouts only (checkpoints with packed HF expert weights such as `experts.gate_up_proj` / `experts.down_proj` are rejected). Mutually exclusive with `allow_serving_layout`.
+
+`trainer.policy.megatron_config.hf_export_config.allow_serving_layout`
+  - **Default**: `false`
+  - **Purpose**: For shared-outer MoE LoRA, keep the compact `[1, ...]` serving layout instead of expanding across experts. Not loadable by `PeftModel.from_pretrained`. Per-expert HF layouts only (packed HF expert checkpoints are rejected). Mutually exclusive with `expand_shared_outer`.

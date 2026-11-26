@@ -563,6 +563,21 @@ def validate_optimizer_offload_to_disk_cfg(cfg: SkyRLTrainConfig):
         raise ValueError("optimizer_offload_to_disk requires a local trainer.ckpt_path.")
 
 
+def validate_hf_export_cfg(cfg: SkyRLTrainConfig) -> None:
+    """Reject HF export settings that would be ignored, or fail only at export time."""
+    if cfg.trainer.ref.megatron_config.hf_export_config.lora_export_format != "merged":
+        raise ValueError(
+            "hf_export_config.lora_export_format applies to the policy only; leave it at 'merged' for trainer.ref."
+        )
+    cfg.trainer.policy.megatron_config.hf_export_config.validate(
+        strategy=cfg.trainer.strategy,
+        lora_rank=cfg.trainer.policy.model.lora.rank,
+        experts_shared_outer_loras=cfg.trainer.policy.megatron_config.lora_config.experts_shared_outer_loras,
+        update_ref_every_epoch=cfg.trainer.update_ref_every_epoch,
+        strategy_field="trainer.strategy",
+    )
+
+
 def validate_cfg(cfg: SkyRLTrainConfig):
     if cfg.trainer.strategy == "fsdp2":
         import warnings
@@ -641,6 +656,7 @@ def validate_cfg(cfg: SkyRLTrainConfig):
         colocate_policy_ref=cfg.trainer.placement.colocate_policy_ref,
         fsdp_cpu_offload=cfg.trainer.policy.fsdp_config.cpu_offload,
     )
+    validate_hf_export_cfg(cfg)
 
     # TODO (devpatel): move to initializing ray and syncing registries codepath at startup
     repopulate_all_registries()

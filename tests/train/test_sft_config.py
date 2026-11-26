@@ -532,3 +532,49 @@ def test_megatron_expert_grid_must_divide_the_world_size(ep, valid):
             ValueError, match=r"divisible by Megatron's expert grid \(pp \* ep \* etp\) 8\. megatron_config\."
         ):
             validate_sft_cfg(cfg)
+
+
+@pytest.mark.parametrize(
+    "overrides, match",
+    [
+        (["strategy=fsdp", "model.lora.rank=8"], "requires strategy='megatron'"),
+        (["strategy=megatron", "model.lora.rank=0"], "requires LoRA"),
+        (
+            [
+                "strategy=megatron",
+                "model.lora.rank=8",
+                "megatron_config.lora_config.experts_shared_outer_loras=true",
+            ],
+            "expand_shared_outer",
+        ),
+    ],
+)
+def test_sft_hf_export_lora_format_rejects_invalid_settings(overrides, match):
+    cfg = _sft_cfg_from_overrides(
+        [
+            "model.path=Qwen/Qwen3-0.6B",
+            "megatron_config.hf_export_config.lora_export_format=adapter",
+            *overrides,
+        ]
+    )
+
+    with pytest.raises(ValueError, match=match):
+        validate_sft_cfg(cfg)
+
+
+def test_sft_hf_export_lora_format_bridges_to_skyrl_config():
+    sft_cfg = _sft_cfg_from_overrides(
+        [
+            "strategy=megatron",
+            "model.path=Qwen/Qwen3-0.6B",
+            "model.lora.rank=8",
+            "megatron_config.lora_config.experts_shared_outer_loras=true",
+            "megatron_config.hf_export_config.lora_export_format=both",
+            "megatron_config.hf_export_config.expand_shared_outer=true",
+        ]
+    )
+    skyrl_cfg = build_skyrl_config_for_sft(sft_cfg)
+    hf_export = skyrl_cfg.trainer.policy.megatron_config.hf_export_config
+    assert hf_export.lora_export_format == "both"
+    assert hf_export.expand_shared_outer is True
+    assert hf_export.allow_serving_layout is False

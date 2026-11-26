@@ -36,6 +36,7 @@ from skyrl.backends.skyrl_train.distributed.megatron.megatron_utils import (
     offload_megatron_grads_to_cpu,
     offload_megatron_model_to_cpu,
     offload_megatron_optimizer,
+    validate_packed_expert_adapter_export_supported,
 )
 from skyrl.backends.skyrl_train.distributed.megatron.optimizer_offload_to_disk import (
     CHECKPOINT_SUBDIR as OFFLOAD_TO_DISK_CHECKPOINT_SUBDIR,
@@ -53,6 +54,7 @@ from skyrl.backends.skyrl_train.workers.megatron.megatron_model_wrapper import (
 from skyrl.backends.skyrl_train.workers.megatron.param_sync import (
     sync_params_for_export,
 )
+from skyrl.train.config.config import VALID_LORA_EXPORT_FORMATS
 
 # Seed offset per pipeline-parallel rank, matching Megatron's standard practice.
 _PP_SEED_OFFSET = 100
@@ -748,6 +750,24 @@ class MegatronStrategy(DistributedStrategy):
                 raise ValueError(f"Unexpected keys in LoRA adapter state dict: {unexpected}")
             self.print(f"Loaded {len(state_dict['model_state_dict'])} LoRA adapters from {adapter_path}.")
 
+    def _run_rank0_and_sync(self, fn, error_context: str) -> None:
+        """Run ``fn`` on rank 0 and broadcast any failure so peer ranks do not hang at later collectives."""
+        error: Optional[Exception] = None
+        if self.is_rank_0():
+            try:
+                fn()
+            except Exception as err:
+                error = err
+        if dist.is_initialized():
+            status = [None if error is None else f"{type(error).__name__}: {error}"]
+            dist.broadcast_object_list(status, src=0)
+            if status[0] is not None:
+                if error is not None:
+                    raise error
+                raise RuntimeError(f"Rank 0 failed to {error_context}: {status[0]}")
+        elif error is not None:
+            raise error
+
     def save_hf_model(
         self,
         bridge,
@@ -757,9 +777,40 @@ class MegatronStrategy(DistributedStrategy):
         *,
         distributed_save: bool = False,
         save_every_n_ranks: int = 1,
+        lora_export_format: str = "merged",
+        peft_config=None,
+        base_model_name_or_path: Optional[str] = None,
+        expand_shared_outer: bool = False,
+        allow_serving_layout: bool = False,
+        moe_grouped_gemm: Optional[bool] = None,
         **kwargs,
     ) -> None:
-        if distributed_save and io.is_cloud_path(output_dir):
+        if lora_export_format not in VALID_LORA_EXPORT_FORMATS:
+            raise ValueError(
+                f"lora_export_format must be one of {VALID_LORA_EXPORT_FORMATS}, got {lora_export_format!r}"
+            )
+        export_merged = lora_export_format in ("merged", "both")
+        export_adapter = lora_export_format in ("adapter", "both")
+
+        if export_adapter:
+            if not self.is_lora or peft_config is None:
+                raise ValueError(
+                    f"lora_export_format={lora_export_format!r} requires a LoRA policy "
+                    "(trainer.policy.model.lora.rank > 0) with a configured PEFT adapter."
+                )
+            if expand_shared_outer and allow_serving_layout:
+                raise ValueError("expand_shared_outer and allow_serving_layout cannot both be True.")
+            if moe_grouped_gemm is None:
+                mcfg = getattr(self, "megatron_config", None)
+                tcfg = getattr(mcfg, "transformer_config_kwargs", None) or {}
+                moe_grouped_gemm = bool(tcfg.get("moe_grouped_gemm", getattr(mcfg, "moe_grouped_gemm", True)))
+            validate_packed_expert_adapter_export_supported(bridge, peft_config, moe_grouped_gemm=moe_grouped_gemm)
+        elif expand_shared_outer or allow_serving_layout:
+            raise ValueError(
+                "expand_shared_outer and allow_serving_layout require lora_export_format to be 'adapter' or 'both'."
+            )
+
+        if export_merged and distributed_save and io.is_cloud_path(output_dir):
             raise ValueError(
                 f"distributed_save=True is incompatible with cloud paths (got {output_dir}). "
                 "Please use a shared filesystem path for distributed_save."
@@ -771,34 +822,56 @@ class MegatronStrategy(DistributedStrategy):
 
         # All ranks call into bridge.
         with io.local_work_dir(output_dir) as work_dir:
-            # strict=False is required for partial exports (e.g. language_model_only
-            # on a Qwen3.5 VL checkpoint, whose shards co-mingle vision and text
-            # weights): the bridge writes a shard only once all its keys are yielded,
-            # so strict=True silently writes zero weights. No-op for complete exports.
-            #
-            # distributed_save fans the shard writes across ranks (one saver per
-            # save_every_n_ranks) instead of serializing them on rank 0 -- the same
-            # standard HF sharded layout, just written in parallel.
-            bridge.save_hf_weights(
-                model.actor_module,
-                work_dir,
-                strict=False,
-                distributed_save=distributed_save,
-                save_every_n_ranks=save_every_n_ranks,
-            )
-            self.print(f"Successfully saved HF safetensors model to {output_dir}")
+            if export_merged:
+                # strict=False is required for partial exports (e.g. language_model_only
+                # on a Qwen3.5 VL checkpoint, whose shards co-mingle vision and text
+                # weights): the bridge writes a shard only once all its keys are yielded,
+                # so strict=True silently writes zero weights. No-op for complete exports.
+                #
+                # distributed_save fans the shard writes across ranks (one saver per
+                # save_every_n_ranks) instead of serializing them on rank 0 -- the same
+                # standard HF sharded layout, just written in parallel.
+                bridge.save_hf_weights(
+                    model.actor_module,
+                    work_dir,
+                    strict=False,
+                    distributed_save=distributed_save,
+                    save_every_n_ranks=save_every_n_ranks,
+                )
+                self.print(f"Successfully saved HF safetensors model to {output_dir}")
 
-            # Only rank 0 saves the Huggingface config and tokenizer.
-            if self.is_rank_0():
-                # Preserve any custom modeling artifacts (e.g. modeling_*.py,
-                # special_tokens_map.json, auto_map-referenced files) that
-                # trust_remote_code models depend on. save_hf_configs below
-                # overwrites config.json/tokenizer files with the strategy's
-                # current view, but save_artifacts is required to copy the
-                # custom Python modules and other artifacts that
-                # save_pretrained() alone does not emit.
-                bridge.hf_pretrained.save_artifacts(work_dir)
-                self.save_hf_configs(self.hf_config, work_dir, tokenizer)
-                self.print(f"Successfully saved HF config and tokenizer to {output_dir}")
+                # Only rank 0 saves the Huggingface config and tokenizer.
+                def _save_merged_metadata() -> None:
+                    # Preserve any custom modeling artifacts (e.g. modeling_*.py,
+                    # special_tokens_map.json, auto_map-referenced files) that
+                    # trust_remote_code models depend on. save_hf_configs below
+                    # overwrites config.json/tokenizer files with the strategy's
+                    # current view, but save_artifacts is required to copy the
+                    # custom Python modules and other artifacts that
+                    # save_pretrained() alone does not emit.
+                    bridge.hf_pretrained.save_artifacts(work_dir)
+                    self.save_hf_configs(self.hf_config, work_dir, tokenizer)
+                    self.print(f"Successfully saved HF config and tokenizer to {output_dir}")
+
+                self._run_rank0_and_sync(_save_merged_metadata, f"save HF config and tokenizer to {output_dir}")
+
+            if export_adapter:
+                adapter_work_dir = os.path.join(work_dir, "lora_adapter") if export_merged else work_dir
+                adapter_output_dir = os.path.join(output_dir, "lora_adapter") if export_merged else output_dir
+                bridge.save_hf_adapter(
+                    model.actor_module,
+                    adapter_work_dir,
+                    peft_config=peft_config,
+                    base_model_name_or_path=base_model_name_or_path,
+                    expand_shared_outer=expand_shared_outer,
+                    allow_serving_layout=allow_serving_layout,
+                )
+
+                def _save_adapter_tokenizer() -> None:
+                    if tokenizer is not None:
+                        tokenizer.save_pretrained(adapter_work_dir)
+
+                self._run_rank0_and_sync(_save_adapter_tokenizer, f"save tokenizer to {adapter_output_dir}")
+                self.print(f"Successfully saved HF PEFT adapter to {adapter_output_dir}")
 
         dist.barrier()

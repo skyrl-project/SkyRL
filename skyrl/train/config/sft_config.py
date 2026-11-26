@@ -634,6 +634,13 @@ def validate_sft_cfg(cfg: SFTConfig) -> None:
         if is_cloud_path(cfg.ckpt_path):
             raise ValueError("optimizer_offload_to_disk requires a local ckpt_path.")
 
+    cfg.megatron_config.hf_export_config.validate(
+        strategy=cfg.strategy,
+        lora_rank=cfg.model.lora.rank,
+        experts_shared_outer_loras=cfg.megatron_config.lora_config.experts_shared_outer_loras,
+        strategy_field="strategy",
+    )
+
     # ---- sequence packing checks ----
     if cfg.use_sequence_packing:
         if cfg.strategy != "megatron":

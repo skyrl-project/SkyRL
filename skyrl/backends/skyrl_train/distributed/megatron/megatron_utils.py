@@ -24,7 +24,7 @@ import logging
 import math
 import os
 import re
-from typing import Any, Dict, Iterator, List, Optional, Union
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -362,6 +362,165 @@ def gdn_in_proj_lora_is_safe(bridge) -> bool:
     if mapping is None:
         return True
     return isinstance(mapping.hf_param, dict) and set(mapping.hf_param) == {"qkv", "z", "b", "a"}
+
+
+def _resolve_hf_param_names(mapping) -> set[str]:
+    hf_param = mapping.hf_param
+    if isinstance(hf_param, str):
+        return {hf_param}
+    if isinstance(hf_param, dict):
+        return set(hf_param.values())
+    return set()
+
+
+def _substitute_expert_wildcard(pattern: str, expert_idx: int) -> Optional[str]:
+    """Instantiate a routed-expert Megatron mapping pattern at layer 0 and ``expert_idx``."""
+    if ".experts." not in pattern:
+        return None
+    if pattern.endswith(".weight*"):
+        prefix = pattern[: -len(".weight*")].replace("**", "0").replace("*", "0")
+        return f"{prefix}.weight{expert_idx}"
+    if ".local_experts.*." in pattern:
+        head, tail = pattern.split(".local_experts.*.", 1)
+        head = head.replace("**", "0").replace("*", "0")
+        tail = tail.replace("**", "0").replace("*", "0")
+        return f"{head}.local_experts.{expert_idx}.{tail}"
+    return None
+
+
+def _packed_hf_expert_module_patterns(bridge) -> List[str]:
+    """Return Megatron module-name patterns whose routed experts collapse onto one packed HF tensor."""
+    model_bridge = getattr(bridge, "_model_bridge", None)
+    if model_bridge is None or not hasattr(model_bridge, "mapping_registry"):
+        return []
+    if hasattr(bridge, "hf_pretrained"):
+        model_bridge.hf_pretrained = bridge.hf_pretrained
+    registry = model_bridge.mapping_registry()
+    patterns: List[str] = []
+    for mapping in getattr(registry, "mappings", ()):
+        mp = getattr(mapping, "megatron_param", "")
+        if not isinstance(mp, str):
+            continue
+        sample_0 = _substitute_expert_wildcard(mp, 0)
+        if sample_0 is None:
+            continue
+        sample_1 = _substitute_expert_wildcard(mp, 1)
+        m0 = registry.megatron_to_hf_lookup(sample_0)
+        m1 = registry.megatron_to_hf_lookup(sample_1)
+        if m0 is None or m1 is None:
+            continue
+        if _resolve_hf_param_names(m0) & _resolve_hf_param_names(m1):
+            if mp.endswith(".weight*"):
+                mod_pattern = mp[: -len(".weight*")]
+            elif mp.endswith(".weight"):
+                mod_pattern = mp[: -len(".weight")]
+            else:
+                mod_pattern = mp
+            if mod_pattern not in patterns:
+                patterns.append(mod_pattern)
+    return patterns
+
+
+def has_packed_hf_expert_mappings(bridge) -> bool:
+    """Whether ``bridge`` maps multiple Megatron routed experts onto one packed HF tensor.
+
+    For checkpoints with packed HF expert weights (e.g. ``experts.gate_up_proj`` /
+    ``experts.down_proj`` on Qwen3.5/3.6 MoE), different Megatron expert indices
+    (``.weight0`` vs ``.weight1``) resolve to the same HF parameter name. Pinned
+    Megatron-Bridge's ``save_hf_adapter`` with shared-outer MoE LoRA emits each
+    expert's 2D slice under that shared HF name, so PEFT dict conversion overwrites
+    all earlier experts (under ``expand_shared_outer=True``) or fails partner
+    validation (under ``allow_serving_layout=True``).
+    """
+    return bool(_packed_hf_expert_module_patterns(bridge))
+
+
+_PLAIN_MODULE_IDENT_RE = re.compile(r"^[A-Za-z0-9_]+$")
+
+
+def peft_targets_routed_experts(peft_config, module_patterns: Optional[Iterable[str]] = None) -> bool:
+    """Whether ``peft_config`` may match any routed-expert module under Megatron-Bridge's matcher rules.
+
+    Sound over-approximation without index sampling: returns ``False`` only when every target
+    entry is a plain module identifier (no dots, wildcards, or regex syntax) outside the packed
+    routed-expert leaves (e.g. attention-only ``["linear_qkv", "linear_proj", "in_proj",
+    "out_proj"]``), or when ``target_modules`` is empty and ``exclude_modules`` explicitly names
+    every packed routed-expert leaf. Any wildcard, dotted path, or regex target conservatively
+    returns ``True``.
+    """
+    canonical = getattr(peft_config, "canonical_mapping", None)
+    targets = list(canonical.keys()) if canonical else getattr(peft_config, "target_modules", None)
+    if isinstance(targets, str):
+        targets = [targets]
+    excludes = getattr(peft_config, "exclude_modules", None) or ()
+    if isinstance(excludes, str):
+        excludes = [excludes]
+
+    patterns = (
+        list(module_patterns)
+        if module_patterns is not None
+        else [
+            "decoder.layers.*.mlp.experts.linear_fc1",
+            "decoder.layers.*.mlp.experts.linear_fc2",
+            "decoder.layers.*.mlp.experts.local_experts.*.linear_fc1",
+            "decoder.layers.*.mlp.experts.local_experts.*.linear_fc2",
+        ]
+    )
+    if not patterns:
+        return False
+
+    packed_leaves = {p.rsplit(".", 1)[-1] for p in patterns}
+
+    if targets:
+        for pattern in targets:
+            if not isinstance(pattern, str):
+                return True
+            # Only a plain identifier outside packed_leaves is guaranteed not to match
+            # either `name == pattern` or `wildcard_match(pattern, full_name)`.
+            if not _PLAIN_MODULE_IDENT_RE.match(pattern) or pattern in packed_leaves:
+                return True
+        return False
+
+    # Empty/None target_modules: Bridge adapts every linear not matched by exclude_modules.
+    exclude_idents = {ex for ex in excludes if isinstance(ex, str) and _PLAIN_MODULE_IDENT_RE.match(ex)}
+    return not packed_leaves.issubset(exclude_idents)
+
+
+def validate_packed_expert_adapter_export_supported(bridge, peft_config=None, *, moe_grouped_gemm: bool = True) -> None:
+    """Reject LoRA HF adapter export on packed HF expert checkpoints when Bridge cannot stack experts.
+
+    Pinned Megatron-Bridge only stacks packed HF expert adapters (``experts.gate_up_proj`` /
+    ``experts.down_proj``) into 3D PEFT ``ParamWrapper`` tensors for non-shared-outer grouped
+    experts (``moe_grouped_gemm=True`` and ``experts_shared_outer_loras=False``). Both
+    ``experts_shared_outer_loras=True`` and sequential experts (``moe_grouped_gemm=False``) emit
+    per-expert 2D slices under the same HF key, which overwrites earlier experts during PEFT dict
+    conversion.
+    """
+    is_shared_outer = getattr(peft_config, "experts_shared_outer_loras", False) is True
+    is_sequential = not moe_grouped_gemm
+    if not is_shared_outer and not is_sequential:
+        return
+    packed_patterns = _packed_hf_expert_module_patterns(bridge)
+    if not packed_patterns:
+        return
+    if peft_config is not None and not peft_targets_routed_experts(peft_config, packed_patterns):
+        return
+    if is_shared_outer:
+        raise ValueError(
+            "LoRA adapter HF export (`hf_export_config.lora_export_format` in ('adapter', 'both')) "
+            "with `experts_shared_outer_loras=True` is not supported for checkpoints with packed HF "
+            "expert weights (e.g. `experts.gate_up_proj` / `experts.down_proj`): Megatron-Bridge's "
+            "`save_hf_adapter` emits each expert under the same HF key and drops earlier experts. "
+            "Use `lora_export_format='merged'` or disable `experts_shared_outer_loras`."
+        )
+    raise ValueError(
+        "LoRA adapter HF export (`hf_export_config.lora_export_format` in ('adapter', 'both')) "
+        "with sequential MoE experts (`moe_grouped_gemm=False`) is not supported for checkpoints "
+        "with packed HF expert weights (e.g. `experts.gate_up_proj` / `experts.down_proj`): "
+        "Megatron-Bridge's `save_hf_adapter` only stacks grouped experts and otherwise emits each "
+        "expert under the same HF key, dropping earlier experts. Use `lora_export_format='merged'` "
+        "or enable `moe_grouped_gemm=True`."
+    )
 
 
 @torch.no_grad()

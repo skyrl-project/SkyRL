@@ -41,6 +41,15 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
             raise ValueError("Serialized FP8 weight sync currently requires trainer.strategy='megatron'.")
         await super().init_weight_sync_state(inference_engine_client, inference_engine_cfg)
 
+    def save_hf_model(self, export_dir: str, tokenizer):
+        hf_export = self.cfg.policy.megatron_config.hf_export_config
+        if hf_export.lora_export_format != "merged":
+            raise ValueError(
+                f"LoRA adapter HF export (lora_export_format={hf_export.lora_export_format!r}) "
+                "currently requires trainer.strategy='megatron'."
+            )
+        super().save_hf_model(export_dir, tokenizer)
+
     def init_model(self, model_path, num_training_steps: int = None):
         assert self.cfg.strategy == "fsdp"
         strategy = FSDPStrategy(

@@ -554,8 +554,21 @@ class FSDPStrategy(DistributedStrategy):
         return ckpt_dir, states
 
     # TODO (erictang000): Test in multi-node setting
-    def save_hf_model(self, model: Union[HFModelWrapper, nn.Module], output_dir: str, tokenizer=None, **kwargs) -> None:
+    def save_hf_model(
+        self,
+        model: Union[HFModelWrapper, nn.Module],
+        output_dir: str,
+        tokenizer=None,
+        *,
+        lora_export_format: str = "merged",
+        **kwargs,
+    ) -> None:
         """Save model in HuggingFace safetensors format using FSDP's full state dict gathering"""
+        if lora_export_format != "merged":
+            raise ValueError(
+                f"LoRA adapter HF export (lora_export_format={lora_export_format!r}) "
+                "currently requires trainer.strategy='megatron'."
+            )
 
         # Step 1: Create output directory (rank 0 only)
         if self.is_rank_0():
