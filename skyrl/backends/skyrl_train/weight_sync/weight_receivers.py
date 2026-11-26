@@ -171,6 +171,34 @@ class SkyrlLoraStagingMixin:
     # these engines through the base __init__, which SkyRL does not override.
     _skyrl_lora_target: dict[str, Any] | None = None
     _skyrl_lora_staged: dict[str, torch.Tensor] | None = None
+    _skyrl_lora_cancelled_rounds: dict[str, None] | None = None
+    _skyrl_lora_min_seq_by_client: dict[str, int] | None = None
+    _SKYRL_MAX_CANCELLED_ROUNDS = 1024
+
+    def _cancelled_lora_rounds(self) -> dict[str, None]:
+        rounds = self._skyrl_lora_cancelled_rounds
+        if rounds is None:
+            rounds = {}
+            self._skyrl_lora_cancelled_rounds = rounds
+        return rounds
+
+    def _min_lora_seq_by_client(self) -> dict[str, int]:
+        seqs = self._skyrl_lora_min_seq_by_client
+        if seqs is None:
+            seqs = {}
+            self._skyrl_lora_min_seq_by_client = seqs
+        return seqs
+
+    @staticmethod
+    def _parse_monotonic_round_id(round_id: Any) -> tuple[str, int] | None:
+        """Parse structured ``"<client_id>:<monotonic_seq>"`` round tokens."""
+        if not isinstance(round_id, str) or ":" not in round_id:
+            return None
+        client_id, seq_str = round_id.rsplit(":", 1)
+        if not client_id or not seq_str.isdigit():
+            return None
+        seq = int(seq_str)
+        return (client_id, seq) if seq > 0 else None
 
     def skyrl_set_lora_receive_target(self, receive_target: dict[str, Any]) -> None:
         """Arm the next update round to build the named adapter."""
@@ -180,6 +208,16 @@ class SkyrlLoraStagingMixin:
 
         if not is_lora_receive_target(receive_target):
             raise ValueError(f"Not a LoRA receive target: {receive_target!r}")
+        round_id = receive_target.get("round_id")
+        parsed_round = self._parse_monotonic_round_id(round_id)
+        if parsed_round is not None:
+            client_id, seq = parsed_round
+            if seq <= self._min_lora_seq_by_client().get(client_id, 0):
+                raise RuntimeError(
+                    f"LoRA receive target round {round_id!r} was already cancelled or superseded; ignoring late arm."
+                )
+        elif round_id is not None and round_id in self._cancelled_lora_rounds():
+            raise RuntimeError(f"LoRA receive target round {round_id!r} was already cancelled; ignoring late arm.")
         if self._skyrl_lora_target is not None:
             raise RuntimeError(
                 f"A LoRA receive target is already armed for "
@@ -190,6 +228,9 @@ class SkyrlLoraStagingMixin:
                 "Received a LoRA weight update but this engine was started without --enable-lora "
                 "(trainer.policy.model.lora.rank > 0 with merge_lora=false sets it)."
             )
+        if parsed_round is not None:
+            client_id, seq = parsed_round
+            self._min_lora_seq_by_client()[client_id] = seq
         self._skyrl_lora_target = dict(receive_target)
 
     def _skyrl_lora_capable(self) -> bool:
@@ -198,6 +239,32 @@ class SkyrlLoraStagingMixin:
 
     def skyrl_lora_armed(self) -> bool:
         return self._skyrl_lora_target is not None
+
+    def skyrl_clear_lora_receive_target(self, round_id: str | None = None) -> None:
+        """Disarm a previously armed LoRA receive target (e.g. after a partial setup failure).
+
+        When ``round_id`` is provided, records the round as cancelled (using a
+        non-evicting per-client monotonic fence for ``<client_id>:<seq>`` tokens
+        and a tombstone set for custom tokens) and only disarms if the currently
+        armed target matches ``round_id``, so a delayed clear from an earlier
+        failed round can never wipe a newer tenant's receive target.
+        """
+        if round_id is not None:
+            parsed_round = self._parse_monotonic_round_id(round_id)
+            if parsed_round is not None:
+                client_id, seq = parsed_round
+                min_seqs = self._min_lora_seq_by_client()
+                if seq > min_seqs.get(client_id, 0):
+                    min_seqs[client_id] = seq
+            else:
+                cancelled = self._cancelled_lora_rounds()
+                cancelled[round_id] = None
+                while len(cancelled) > self._SKYRL_MAX_CANCELLED_ROUNDS:
+                    cancelled.pop(next(iter(cancelled)))
+            if self._skyrl_lora_target is not None and self._skyrl_lora_target.get("round_id") != round_id:
+                return
+        self._skyrl_lora_target = None
+        self._skyrl_lora_staged = None
 
     def skyrl_begin_lora_update(self) -> None:
         self._skyrl_lora_staged = {}
@@ -241,11 +308,21 @@ class SkyrlLoraStagingMixin:
 
         target = self._skyrl_lora_target
         staged = self._skyrl_lora_staged
+        if target is None:
+            self._skyrl_lora_staged = None
+            raise RuntimeError("skyrl_finish_lora_update called without an armed LoRA receive target.")
+        if staged is None:
+            # Armed, but start_weight_update() has not run for this target yet
+            # (e.g. a delayed finish_weight_update() from an earlier timed-out
+            # round arrived after a new tenant armed). Keep the newly armed
+            # target intact instead of disarming it.
+            raise RuntimeError(
+                f"skyrl_finish_lora_update called for {target['lora_name']!r} before start_weight_update; "
+                "leaving armed target intact."
+            )
         # Disarm before the work: one round per arm, even if this raises.
         self._skyrl_lora_target = None
         self._skyrl_lora_staged = None
-        if target is None:
-            raise RuntimeError("skyrl_finish_lora_update called without an armed LoRA receive target.")
         if not staged:
             raise RuntimeError(f"LoRA weight update for {target['lora_name']!r} finished without receiving any tensors")
         tensors = expand_lora_aliases(staged, target.get("aliases") or {})

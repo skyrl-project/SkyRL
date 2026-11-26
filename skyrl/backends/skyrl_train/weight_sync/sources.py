@@ -410,6 +410,11 @@ class LoraAdapterWeightSource(WeightSource):
     def _drop_cached_metadata(self) -> None:
         self.__dict__.pop("metadata", None)
 
+    def discard_prepared(self) -> None:
+        """Drop a prepared export that will not be sent (e.g. after a failed setup)."""
+        self._prepared = None
+        self._drop_cached_metadata()
+
     def _prepared_state(self) -> Tuple[Dict[str, torch.Tensor], Dict[str, str], Dict[str, Any]]:
         """The current round's export. Raises rather than exporting implicitly.
 

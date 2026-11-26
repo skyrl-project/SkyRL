@@ -1,3 +1,4 @@
+import asyncio
 import io
 import os
 from typing import TYPE_CHECKING, Optional
@@ -29,7 +30,12 @@ from skyrl.backends.skyrl_train.workers.worker import (
     PolicyWorkerBase,
     RefWorkerBase,
 )
-from skyrl.backends.skyrl_train.workers.worker_utils import get_inference_weight_prefix
+from skyrl.backends.skyrl_train.workers.worker_utils import (
+    PeerRankSyncError,
+    barrier_with_error_propagation,
+    cleanup_unawaited_task,
+    get_inference_weight_prefix,
+)
 
 if TYPE_CHECKING:
     from skyrl.train.config import InferenceEngineConfig
@@ -171,31 +177,55 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
                 for name, tensor in lora_params.items()
             }
 
+        sync_error: Optional[BaseException] = None
         if torch.distributed.get_rank() == 0:
-            os.makedirs(lora_sync_path, exist_ok=True)
+            try:
+                import time
 
-            peft_config = asdict(peft_model.peft_config.get("default", {}))
-            peft_config["task_type"] = peft_config["task_type"].value
-            peft_config["peft_type"] = peft_config["peft_type"].value
-            peft_config["target_modules"] = list(peft_config["target_modules"])
+                from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
+                    RemoteInferenceClient,
+                    control_plane_timeout_budget,
+                    drain_client_pending_lora_loads,
+                    rank0_phase_timeout_s,
+                )
 
-            # Save LoRA parameters and config
-            save_file(lora_params, os.path.join(lora_sync_path, "adapter_model.safetensors"))
-            with io.open(os.path.join(lora_sync_path, "adapter_config.json"), "w", encoding="utf-8") as f:
-                json.dump(peft_config, f, ensure_ascii=False, indent=4)
+                phase_budget = rank0_phase_timeout_s()
+                phase_deadline = time.monotonic() + phase_budget if phase_budget > 0 else None
+                unresolved_loads = await drain_client_pending_lora_loads(
+                    inference_engine_client, timeout_s=phase_budget
+                )
+                if unresolved_loads:
+                    raise TimeoutError(
+                        f"Cannot overwrite disk LoRA files for {lora_name!r} while prior load_lora_adapter "
+                        f"request(s) are still in flight or unconfirmed: {', '.join(unresolved_loads)}"
+                    )
 
-            # Send LoRA disk loading request to inference engine.
-            from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
-                RemoteInferenceClient,
-            )
+                os.makedirs(lora_sync_path, exist_ok=True)
 
-            if isinstance(inference_engine_client, RemoteInferenceClient):
-                await inference_engine_client.load_lora_adapter(lora_name, lora_sync_path)
-            else:
-                lora_request = LoraLoadRequest(lora_path=lora_sync_path, lora_name=lora_name)
-                await inference_engine_client.update_named_weights(lora_request)
+                peft_config = asdict(peft_model.peft_config.get("default", {}))
+                peft_config["task_type"] = peft_config["task_type"].value
+                peft_config["peft_type"] = peft_config["peft_type"].value
+                peft_config["target_modules"] = list(peft_config["target_modules"])
 
-        torch.distributed.barrier()
+                # Save LoRA parameters and config
+                save_file(lora_params, os.path.join(lora_sync_path, "adapter_model.safetensors"))
+                with io.open(os.path.join(lora_sync_path, "adapter_config.json"), "w", encoding="utf-8") as f:
+                    json.dump(peft_config, f, ensure_ascii=False, indent=4)
+
+                # Send LoRA disk loading request within the remaining single phase budget.
+                load_budget = (
+                    max(0.05, phase_deadline - time.monotonic()) if phase_deadline is not None else phase_budget
+                )
+                with control_plane_timeout_budget(load_budget):
+                    if isinstance(inference_engine_client, RemoteInferenceClient):
+                        await inference_engine_client.load_lora_adapter(lora_name, lora_sync_path)
+                    else:
+                        lora_request = LoraLoadRequest(lora_path=lora_sync_path, lora_name=lora_name)
+                        await inference_engine_client.update_named_weights(lora_request)
+            except (Exception, asyncio.CancelledError) as exc:
+                sync_error = exc
+
+        barrier_with_error_propagation(sync_error, stage="LoRA adapter sync")
 
     async def broadcast_to_inference_engines(
         self,
@@ -218,16 +248,27 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
             # PolicyWorkerBase) basename-guards against a malformed model_id
             # escaping lora_sync_path even though api.py already validates IDs.
             cache_reset_task = self._reset_prefix_cache_task(inference_engine_client, inference_engine_cfg)
-            torch.cuda.empty_cache()
-            lora_name, lora_sync_path = self._resolve_lora_sync_target(model_id)
-            await self._save_lora_adapters_and_sync(
-                peft_model, lora_sync_path, inference_engine_client, lora_name=lora_name
-            )
-            if cache_reset_task is not None:
-                await cache_reset_task
-            if self.cfg.placement.colocate_all:
+            try:
                 torch.cuda.empty_cache()
-            torch.distributed.barrier()
+                lora_name, lora_sync_path = self._resolve_lora_sync_target(model_id)
+                await self._save_lora_adapters_and_sync(
+                    peft_model, lora_sync_path, inference_engine_client, lora_name=lora_name
+                )
+                cache_error: Optional[BaseException] = None
+                if cache_reset_task is not None:
+                    try:
+                        await self._await_prefix_cache_reset(cache_reset_task)
+                    except (Exception, asyncio.CancelledError) as exc:
+                        cache_error = exc
+                    finally:
+                        cache_reset_task = None
+                if self.cfg.placement.colocate_all:
+                    torch.cuda.empty_cache()
+                barrier_with_error_propagation(cache_error, stage="prefix cache reset")
+            except PeerRankSyncError:
+                return
+            finally:
+                await cleanup_unawaited_task(cache_reset_task)
             return
 
         await self._sync_weights_to_inference_engines(inference_engine_client, inference_engine_cfg)

@@ -1,5 +1,7 @@
+import asyncio
+import inspect
 import math
-from typing import Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -44,6 +46,89 @@ def get_inference_weight_prefix(is_multimodal_lm_only: bool) -> str:
     not a universal naming convention for all VLM architectures.
     """
     return "language_model." if is_multimodal_lm_only else ""
+
+
+class PeerRankSyncError(RuntimeError):
+    """Raised on non-failing ranks when a peer rank failed before a sync barrier.
+
+    Lets non-failing ranks unwind out of multi-phase sync helpers without
+    entering subsequent collectives or barriers; top-level sync entrypoints
+    catch this so ``ray.get`` surfaces the failing rank's original exception.
+    """
+
+
+def exchange_rank_errors(
+    local_error: Optional[BaseException],
+) -> Tuple[bool, Optional[Tuple[int, str, str]]]:
+    """Synchronize all ranks and exchange whether any rank failed.
+
+    Returns ``(any_failed, first_peer_error)`` where ``first_peer_error`` is
+    ``(peer_rank, exc_type, exc_msg)`` for the first peer rank that failed
+    (excluding this rank), or ``None`` if no peer failed.
+    """
+    if dist.is_available() and dist.is_initialized():
+        world_size = dist.get_world_size()
+        if world_size > 1:
+            rank = dist.get_rank()
+            err_info: Optional[Tuple[int, str, str]] = (
+                (rank, type(local_error).__name__, str(local_error)[:500]) if local_error is not None else None
+            )
+            gathered: List[Optional[Tuple[int, str, str]]] = [None] * world_size
+            dist.all_gather_object(gathered, err_info)
+            first_peer_err: Optional[Tuple[int, str, str]] = None
+            any_failed = local_error is not None
+            for peer_err in gathered:
+                if peer_err is not None:
+                    any_failed = True
+                    if peer_err[0] != rank and first_peer_err is None:
+                        first_peer_err = peer_err
+            return any_failed, first_peer_err
+
+    dist.barrier()
+    return local_error is not None, None
+
+
+def barrier_with_error_propagation(
+    local_error: Optional[BaseException],
+    *,
+    stage: str,
+) -> None:
+    """Synchronize all ranks and abort together if any rank failed.
+
+    Replaces bare ``torch.distributed.barrier()`` after rank-subset work (such
+    as rank-0 ``load_lora_adapter`` or writer-rank file export). On an
+    initialized multi-rank process group, uses ``all_gather_object`` both as
+    the barrier and to exchange failure status so a failure on one rank never
+    strands peers inside ``barrier()`` until Gloo times out and closes pairs.
+    """
+    _, first_peer_err = exchange_rank_errors(local_error)
+    if local_error is not None:
+        raise local_error
+    if first_peer_err is not None:
+        peer_rank, exc_type, exc_msg = first_peer_err
+        raise PeerRankSyncError(f"Rank {peer_rank} failed during {stage}: {exc_type}: {exc_msg}")
+
+
+async def cleanup_unawaited_task(task: Any) -> None:
+    """Clean up an optional coroutine/future if an earlier error skipped awaiting it.
+
+    For an unstarted coroutine, closes it synchronously; for an already-scheduled
+    Future/Task, cancels it and awaits its settlement so no background work
+    outlives the failed sync round.
+    """
+    if task is None:
+        return
+    if inspect.iscoroutine(task):
+        task.close()
+    elif isinstance(task, asyncio.Future):
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except (Exception, asyncio.CancelledError):
+                pass
+        elif not task.cancelled():
+            task.exception()
 
 
 @torch.no_grad()

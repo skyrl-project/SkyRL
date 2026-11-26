@@ -1,7 +1,9 @@
+import asyncio
 import dataclasses
 import functools
 import os
 import shutil
+import threading
 import time
 from collections import defaultdict
 from datetime import timedelta
@@ -150,8 +152,12 @@ from skyrl.backends.skyrl_train.workers.worker import (
 from skyrl.backends.skyrl_train.workers.worker_utils import (
     BaseBatchIterator,
     BatchIterator,
+    PeerRankSyncError,
     TokenBasedBatchIterator,
     all_reduce_metrics,
+    barrier_with_error_propagation,
+    cleanup_unawaited_task,
+    exchange_rank_errors,
     get_microbatch_iterator,
     reduce_metrics,
 )
@@ -1941,15 +1947,28 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             base_sync_path = self.cfg.policy.model.lora.lora_sync_path
             probe_path = os.path.join(base_sync_path, ".skyrl_lora_sync_probe")
             token = uuid.uuid4().hex if rank == 0 else None
+            probe_error: Optional[BaseException] = None
             if rank == 0:
-                # Written before the gather so every rank checks after it exists.
-                os.makedirs(base_sync_path, exist_ok=True)
-                with open(probe_path, "w", encoding="utf-8") as f:
-                    f.write(token)
+                try:
+                    # Written before the gather so every rank checks after it exists.
+                    os.makedirs(base_sync_path, exist_ok=True)
+                    with open(probe_path, "w", encoding="utf-8") as f:
+                        f.write(token)
+                except Exception as exc:
+                    probe_error = exc
 
             infos = [None] * torch.distributed.get_world_size()
-            torch.distributed.all_gather_object(infos, (socket.gethostname(), token))
-            hostnames = [host for host, _ in infos]
+            err_info = (rank, type(probe_error).__name__, str(probe_error)[:500]) if probe_error is not None else None
+            torch.distributed.all_gather_object(infos, (socket.gethostname(), token, err_info))
+            if probe_error is not None:
+                raise probe_error
+            for _, _, peer_err in infos:
+                if peer_err is not None:
+                    peer_rank, exc_type, exc_msg = peer_err
+                    raise PeerRankSyncError(
+                        f"Rank {peer_rank} failed during LoRA sync writer probe: {exc_type}: {exc_msg}"
+                    )
+            hostnames = [host for host, _, _ in infos]
             node_leader = hostnames.index(hostnames[rank]) == rank
 
             # The token guards against a stale probe left on a node-local disk
@@ -2033,6 +2052,12 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 
         from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
             RemoteInferenceClient,
+            control_plane_timeout_budget,
+            rank0_phase_timeout_s,
+        )
+        from skyrl.backends.skyrl_train.weight_sync.control_plane import (
+            drain_inflight_weight_sync_requests,
+            weight_sync_client_deadline,
         )
 
         if not isinstance(inference_engine_client, RemoteInferenceClient):
@@ -2044,41 +2069,159 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 
         rank = torch.distributed.get_rank()
         started = time.perf_counter()
-        source.set_lora_name(lora_name)
-        await self._weight_sync_thread(source.prepare)
-        exported = time.perf_counter()
-
         unique = aliased = 0
-        if rank == 0:
-            receive_target = source.receive_target
-            # Read while the export is still prepared: the send consumes the
-            # stream and drops it, and re-reading afterwards would be a
-            # collective this rank would run alone.
-            unique = len(source.metadata)
-            aliased = len(receive_target["aliases"])
-            await inference_engine_client.set_lora_receive_target(receive_target)
-        # No rank may enter the transfer before every worker is armed: rank 0
-        # opens the round trip, the others only join its collectives.
-        torch.distributed.barrier()
+        phase_budget = rank0_phase_timeout_s()
+        send_error: Optional[BaseException] = None
 
-        with self._expandable_segments_disabled_for_sync(force=engine.skyrl_force_disable_expandable_segments):
-            await self._weight_sync_thread(engine.send_weights)
+        async def _drain_inflight_cancellable(deadline_at: Optional[float]) -> List[str]:
+            cancel_event = threading.Event()
+            drain_task = asyncio.create_task(
+                asyncio.to_thread(drain_inflight_weight_sync_requests, deadline_at, cancel_event)
+            )
+            try:
+                return await asyncio.shield(drain_task)
+            except asyncio.CancelledError:
+                cancel_event.set()
+                try:
+                    await drain_task
+                except Exception:  # noqa: BLE001
+                    pass
+                raise
+
+        try:
+            prepare_error: Optional[BaseException] = None
+            try:
+                source.set_lora_name(lora_name)
+                await self._await_weight_sync_thread(source.prepare)
+            except (Exception, asyncio.CancelledError) as exc:
+                prepare_error = exc
+            # Confirm every rank prepared before rank 0 arms the receivers;
+            # otherwise a non-zero preparation failure would leave servers armed.
+            barrier_with_error_propagation(prepare_error, stage="in-memory LoRA export")
+            exported = time.perf_counter()
+
+            arm_error: Optional[BaseException] = None
+            if rank == 0:
+                try:
+                    arm_deadline = time.monotonic() + phase_budget if phase_budget > 0 else None
+                    still_running = await _drain_inflight_cancellable(arm_deadline)
+                    if still_running:
+                        raise TimeoutError(
+                            f"Cannot arm LoRA receive target {lora_name!r}: prior weight-sync request(s) "
+                            f"still in flight: {', '.join(still_running)}"
+                        )
+                    receive_target = source.receive_target
+                    # Read while the export is still prepared: the send consumes the
+                    # stream and drops it, and re-reading afterwards would be a
+                    # collective this rank would run alone.
+                    unique = len(source.metadata)
+                    aliased = len(receive_target["aliases"])
+                    remaining_arm = (
+                        max(0.05, arm_deadline - time.monotonic()) if arm_deadline is not None else phase_budget
+                    )
+                    with control_plane_timeout_budget(remaining_arm):
+                        await inference_engine_client.set_lora_receive_target(receive_target)
+                except (Exception, asyncio.CancelledError) as exc:
+                    arm_error = exc
+            # No rank may enter the transfer before every worker is armed: rank 0
+            # opens the round trip, the others only join its collectives.
+            barrier_with_error_propagation(arm_error, stage="in-memory LoRA receive target setup")
+
+            send_deadline = time.monotonic() + phase_budget if phase_budget > 0 else None
+            with (
+                self._expandable_segments_disabled_for_sync(force=engine.skyrl_force_disable_expandable_segments),
+                weight_sync_client_deadline(send_deadline),
+            ):
+                try:
+                    await self._await_weight_sync_thread(engine.send_weights)
+                except PeerRankSyncError:
+                    # A peer (e.g. rank-0 IPC sender) already failed; keep send_error=None
+                    # so exchange_rank_errors below propagates only the failing rank's error.
+                    pass
+                except (Exception, asyncio.CancelledError) as exc:
+                    send_error = exc
+        finally:
+            source.discard_prepared()
         sent = time.perf_counter()
 
-        if rank == 0:
-            await inference_engine_client.load_lora_adapter(lora_name, in_memory=True)
-            logger.info(
-                "LoRA sync (memory): adapter {!r} {} unique tensors (+{} aliased, {:.1f}x dedupe), "
-                "exported in {:.2f}s, sent in {:.2f}s, registered on vLLM in {:.2f}s",
-                lora_name,
-                unique,
-                aliased,
-                (unique + aliased) / max(unique, 1),
-                exported - started,
-                sent - exported,
-                time.perf_counter() - sent,
+        # Exchange send status before loading the adapter. If send_weights failed
+        # on any rank (for example in start_weight_update before finish_weight_update
+        # disarmed receivers), rank 0 must drain any timed-out blocking HTTP requests
+        # and clear the armed receive targets in lockstep so the next tenant's
+        # set_lora_receive_target is not rejected as double-armed.
+        any_send_failed, peer_send_err = exchange_rank_errors(send_error)
+        if any_send_failed:
+            cleanup_error: Optional[BaseException] = None
+            if rank == 0:
+                # Mark the current round dirty BEFORE awaiting cleanup so even if
+                # rank 0 is cancelled mid-drain, the next round's set_lora_receive_target
+                # will still run preflight disarm for this round_id after settlement.
+                # A confirmed clear_lora_receive_target below clears the dirty marker.
+                inference_engine_client.mark_lora_servers_dirty()
+                try:
+                    cleanup_deadline = time.monotonic() + phase_budget if phase_budget > 0 else None
+                    drain_deadline = time.monotonic() + max(0.05, phase_budget * 0.5) if phase_budget > 0 else None
+                    still_running = await _drain_inflight_cancellable(drain_deadline)
+                    if still_running:
+                        # Do NOT disarm servers while a prior lifecycle RPC is still
+                        # running or unconfirmed: disarming now could let a delayed
+                        # /start_weight_update fall through to a base-model reload.
+                        # Keep the target armed and dirty so preflight disarms only
+                        # after all in-flight RPCs settle.
+                        if send_error is not None:
+                            send_error.add_note(
+                                f"Prior blocking weight-sync request(s) still in flight or unconfirmed after send "
+                                f"failure; deferring target clear until settlement: {', '.join(still_running)}"
+                            )
+                    else:
+                        clear_budget = (
+                            max(0.05, cleanup_deadline - time.monotonic())
+                            if cleanup_deadline is not None
+                            else phase_budget
+                        )
+                        failed_clears = await inference_engine_client.clear_lora_receive_target(timeout_s=clear_budget)
+                        if failed_clears and send_error is not None:
+                            details = ", ".join(
+                                f"{url}: {type(exc).__name__}: {exc}" for url, exc in failed_clears.items()
+                            )
+                            send_error.add_note(
+                                f"Rollback skyrl_clear_lora_receive_target also failed on "
+                                f"{len(failed_clears)} server(s): {details}"
+                            )
+                except (Exception, asyncio.CancelledError) as exc:
+                    cleanup_error = exc
+                    if send_error is not None:
+                        send_error.add_note(
+                            f"Rollback skyrl_clear_lora_receive_target raised {type(exc).__name__}: {exc}"
+                        )
+            barrier_with_error_propagation(
+                send_error if send_error is not None else cleanup_error,
+                stage="in-memory LoRA send cleanup",
             )
-        torch.distributed.barrier()
+            if peer_send_err is not None:
+                peer_rank, exc_type, exc_msg = peer_send_err
+                raise PeerRankSyncError(f"Rank {peer_rank} failed during in-memory LoRA send: {exc_type}: {exc_msg}")
+            return
+
+        load_error: Optional[BaseException] = None
+        if rank == 0:
+            try:
+                with control_plane_timeout_budget(phase_budget):
+                    await inference_engine_client.load_lora_adapter(lora_name, in_memory=True)
+                logger.info(
+                    "LoRA sync (memory): adapter {!r} {} unique tensors (+{} aliased, {:.1f}x dedupe), "
+                    "exported in {:.2f}s, sent in {:.2f}s, registered on vLLM in {:.2f}s",
+                    lora_name,
+                    unique,
+                    aliased,
+                    (unique + aliased) / max(unique, 1),
+                    exported - started,
+                    sent - exported,
+                    time.perf_counter() - sent,
+                )
+            except (Exception, asyncio.CancelledError) as exc:
+                load_error = exc
+        barrier_with_error_propagation(load_error, stage="in-memory LoRA adapter load")
 
     async def _save_lora_adapters_and_sync(
         self, lora_sync_path, inference_engine_client, lora_name: str = SKYRL_LORA_ADAPTER_NAME
@@ -2098,107 +2241,148 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         )
         from safetensors.torch import save_file
 
+        from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
+            drain_client_pending_lora_loads,
+            rank0_phase_timeout_s,
+        )
         from skyrl.backends.skyrl_train.weight_sync.sources import (
             adapter_target_modules,
         )
 
-        # Every rank must participate in the bridge's collective export, but only
-        # the writer ranks materialize the gathered tensors: with MoE expert
-        # adapters the full adapter state can reach tens of GB (per-expert
-        # replication), and keeping a copy on all ranks multiplies the CPU
-        # spike by ranks-per-node (enough to OOM a node during sync). `cpu`
-        # only gates the bridge's trailing device-to-host copy (not its
-        # collectives), so non-writers skip that copy for tensors they discard.
+        # Ensure any prior timed-out load_lora_adapter has finished reading disk
+        # adapter files before any writer rank exports and overwrites lora_sync_path.
+        preflight_error: Optional[BaseException] = None
+        if torch.distributed.get_rank() == 0:
+            try:
+                unresolved_loads = await drain_client_pending_lora_loads(
+                    inference_engine_client, timeout_s=rank0_phase_timeout_s()
+                )
+                if unresolved_loads:
+                    raise TimeoutError(
+                        f"Cannot overwrite disk LoRA files for {lora_name!r} while prior load_lora_adapter "
+                        f"request(s) are still in flight or unconfirmed: {', '.join(unresolved_loads)}"
+                    )
+            except (Exception, asyncio.CancelledError) as exc:
+                preflight_error = exc
+        barrier_with_error_propagation(preflight_error, stage="LoRA disk load preflight")
+
+        # Export with cpu=False on every rank so Megatron-Bridge never performs
+        # writer-only CPU copies inside the iterator before yielding (where a
+        # host OOM would escape before collectives finish). Writer ranks copy
+        # each yielded tensor to CPU inside the guarded block below, and on
+        # error keep draining the iterator so all ranks stay aligned on
+        # collectives until the barrier exchanges the failure.
         keep_state = self._is_lora_sync_writer_rank()
         # Shared-outer grouped-expert LoRA emits the per-expert side of packed-HF
         # models (e.g. Qwen3.5/3.6 MoE) as one 2D slice per expert under the same
         # expert-agnostic name; collect repeats in emission order (expert 0..E-1)
         # and stack them back into the (E, out, in) layout the converter expects.
         adapter_tensor_lists: Dict[str, List[torch.Tensor]] = {}
-        for name, tensor in self.bridge.export_adapter_weights(self.actor_module, cpu=keep_state, show_progress=False):
-            if keep_state:
-                # Keep the training dtype (bf16): upcasting to float32 doubles
-                # the already-large per-expert adapter state (and the file the
-                # engines re-read every step) for no fidelity gain -- vLLM casts
-                # adapters to its lora dtype on load.
-                adapter_tensor_lists.setdefault(f"base_model.model.{name}", []).append(tensor.clone())
-        adapter_state = {
-            name: tensors[0] if len(tensors) == 1 else torch.stack(tensors, dim=0)
-            for name, tensors in adapter_tensor_lists.items()
-        }
+        write_error: Optional[BaseException] = None
+        for name, tensor in self.bridge.export_adapter_weights(self.actor_module, cpu=False, show_progress=False):
+            if keep_state and write_error is None:
+                try:
+                    # Keep the training dtype (bf16): upcasting to float32 doubles
+                    # the already-large per-expert adapter state (and the file the
+                    # engines re-read every step) for no fidelity gain -- vLLM casts
+                    # adapters to its lora dtype on load.
+                    adapter_tensor_lists.setdefault(f"base_model.model.{name}", []).append(
+                        tensor.detach().to(device="cpu", copy=True)
+                    )
+                except Exception as exc:
+                    # Finish draining export_adapter_weights so collectives stay aligned,
+                    # then propagate the failure to peers at the barrier below.
+                    write_error = exc
+                    adapter_tensor_lists.clear()
 
         rank = torch.distributed.get_rank()
-        if keep_state:
-            os.makedirs(lora_sync_path, exist_ok=True)
+        if keep_state and write_error is None:
+            try:
+                adapter_state = {
+                    name: tensors[0] if len(tensors) == 1 else torch.stack(tensors, dim=0)
+                    for name, tensors in adapter_tensor_lists.items()
+                }
+                os.makedirs(lora_sync_path, exist_ok=True)
 
-            # vLLM applies one `lora_alpha / r` (r = the config rank written
-            # below) to every module, while megatron-bridge scales each adapter
-            # by `alpha / dim` with that module's *effective* rank -- under
-            # normalize_moe_lora the grouped experts run at rank // topk. Fold
-            # the ratio into lora_B so the sampled policy is the trained one.
-            # Must run before the 3D->flat rewrite below erases the per-expert
-            # rank from the tensor shapes.
-            config_rank = self.lora_cls.dim
-            adapter_state, rescaled = fold_lora_rank_scale_for_vllm(adapter_state, config_rank=config_rank)
-            if rescaled and rank == 0:
-                logger.info(
-                    "LoRA sync: folded rank scale into lora_B for vLLM (config r={}): {}",
-                    config_rank,
-                    ", ".join(f"{n} tensors at rank {r} x{config_rank / r:g}" for r, n in sorted(rescaled.items())),
+                # vLLM applies one `lora_alpha / r` (r = the config rank written
+                # below) to every module, while megatron-bridge scales each adapter
+                # by `alpha / dim` with that module's *effective* rank -- under
+                # normalize_moe_lora the grouped experts run at rank // topk. Fold
+                # the ratio into lora_B so the sampled policy is the trained one.
+                # Must run before the 3D->flat rewrite below erases the per-expert
+                # rank from the tensor shapes.
+                config_rank = self.lora_cls.dim
+                adapter_state, rescaled = fold_lora_rank_scale_for_vllm(adapter_state, config_rank=config_rank)
+                if rescaled and rank == 0:
+                    logger.info(
+                        "LoRA sync: folded rank scale into lora_B for vLLM (config r={}): {}",
+                        config_rank,
+                        ", ".join(f"{n} tensors at rank {r} x{config_rank / r:g}" for r, n in sorted(rescaled.items())),
+                    )
+
+                # Same artifact as the in-memory path: alpha / r folded into lora_B
+                # and published with lora_alpha == r (see fold_lora_alpha_for_vllm).
+                adapter_state = fold_lora_alpha_for_vllm(
+                    adapter_state, config_rank=config_rank, alpha=self.lora_cls.alpha
                 )
 
-            # Same artifact as the in-memory path: alpha / r folded into lora_B
-            # and published with lora_alpha == r (see fold_lora_alpha_for_vllm).
-            adapter_state = fold_lora_alpha_for_vllm(adapter_state, config_rank=config_rank, alpha=self.lora_cls.alpha)
-
-            # Rewrite fused-MoE expert LoRA into vLLM's flat PEFT layout so
-            # merge_lora=False on-policy sync is accepted (otherwise
-            # load_lora_adapter rejects `experts.down_proj`). See
-            # _convert_moe_experts_lora_to_vllm for the layout details.
-            adapter_state = _convert_moe_experts_lora_to_vllm(
-                adapter_state, num_moe_experts=getattr(self.provider, "num_moe_experts", None)
-            )
-
-            target_modules = adapter_target_modules(self.bridge, adapter_state.keys())
-            base_model_name_or_path = str(
-                getattr(self, "_logical_model_path", "")
-                or getattr(self.bridge.hf_pretrained, "model_name_or_path", "")
-                or getattr(self.bridge.hf_pretrained, "name_or_path", "")
-            )
-            adapter_config = mark_alpha_folded(
-                build_adapter_config_dict(
-                    self.lora_cls,
-                    target_modules=target_modules,
-                    base_model_name_or_path=base_model_name_or_path,
+                # Rewrite fused-MoE expert LoRA into vLLM's flat PEFT layout so
+                # merge_lora=False on-policy sync is accepted (otherwise
+                # load_lora_adapter rejects `experts.down_proj`). See
+                # _convert_moe_experts_lora_to_vllm for the layout details.
+                adapter_state = _convert_moe_experts_lora_to_vllm(
+                    adapter_state, num_moe_experts=getattr(self.provider, "num_moe_experts", None)
                 )
-            )
 
-            # Atomic renames so concurrent writers (shared filesystem) and the
-            # engines' readers never observe partial files.
-            weights_path = os.path.join(lora_sync_path, "adapter_model.safetensors")
-            config_path = os.path.join(lora_sync_path, "adapter_config.json")
-            save_file(adapter_state, f"{weights_path}.tmp{rank}")
-            os.replace(f"{weights_path}.tmp{rank}", weights_path)
-            with open(f"{config_path}.tmp{rank}", "w", encoding="utf-8") as f:
-                json.dump(adapter_config, f, ensure_ascii=False, indent=4)
-            os.replace(f"{config_path}.tmp{rank}", config_path)
+                target_modules = adapter_target_modules(self.bridge, adapter_state.keys())
+                base_model_name_or_path = str(
+                    getattr(self, "_logical_model_path", "")
+                    or getattr(self.bridge.hf_pretrained, "model_name_or_path", "")
+                    or getattr(self.bridge.hf_pretrained, "name_or_path", "")
+                )
+                adapter_config = mark_alpha_folded(
+                    build_adapter_config_dict(
+                        self.lora_cls,
+                        target_modules=target_modules,
+                        base_model_name_or_path=base_model_name_or_path,
+                    )
+                )
+
+                # Atomic renames so concurrent writers (shared filesystem) and the
+                # engines' readers never observe partial files.
+                weights_path = os.path.join(lora_sync_path, "adapter_model.safetensors")
+                config_path = os.path.join(lora_sync_path, "adapter_config.json")
+                save_file(adapter_state, f"{weights_path}.tmp{rank}")
+                os.replace(f"{weights_path}.tmp{rank}", weights_path)
+                with open(f"{config_path}.tmp{rank}", "w", encoding="utf-8") as f:
+                    json.dump(adapter_config, f, ensure_ascii=False, indent=4)
+                os.replace(f"{config_path}.tmp{rank}", config_path)
+            except (Exception, asyncio.CancelledError) as exc:
+                write_error = exc
 
         # All nodes' files must be in place before the engines re-read them.
-        torch.distributed.barrier()
+        barrier_with_error_propagation(write_error, stage="LoRA adapter export")
 
+        load_error: Optional[BaseException] = None
         if rank == 0:
-            # Send LoRA disk loading request to inference engine.
-            from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
-                RemoteInferenceClient,
-            )
+            try:
+                # Send LoRA disk loading request to inference engine.
+                from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
+                    RemoteInferenceClient,
+                    control_plane_timeout_budget,
+                    rank0_phase_timeout_s,
+                )
 
-            if isinstance(inference_engine_client, RemoteInferenceClient):
-                await inference_engine_client.load_lora_adapter(lora_name, lora_sync_path)
-            else:
-                lora_request = LoraLoadRequest(lora_path=lora_sync_path, lora_name=lora_name)
-                await inference_engine_client.update_named_weights(lora_request)
+                with control_plane_timeout_budget(rank0_phase_timeout_s()):
+                    if isinstance(inference_engine_client, RemoteInferenceClient):
+                        await inference_engine_client.load_lora_adapter(lora_name, lora_sync_path)
+                    else:
+                        lora_request = LoraLoadRequest(lora_path=lora_sync_path, lora_name=lora_name)
+                        await inference_engine_client.update_named_weights(lora_request)
+            except (Exception, asyncio.CancelledError) as exc:
+                load_error = exc
 
-        torch.distributed.barrier()
+        barrier_with_error_propagation(load_error, stage="LoRA adapter load")
 
     async def broadcast_to_inference_engines(
         self,
@@ -2216,17 +2400,30 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             # so sample(model=<model_id>) routes correctly. Single-tenant
             # (model_id=None) keeps the legacy shared path + name.
             cache_reset_task = self._reset_prefix_cache_task(inference_engine_client, inference_engine_cfg)
-            torch.cuda.empty_cache()
-            lora_name, lora_sync_path = self._resolve_lora_sync_target(model_id)
-            if self._lora_sync_mode_is_memory():
-                await self._publish_lora_adapter_in_memory(lora_name, inference_engine_client)
-            else:
-                await self._save_lora_adapters_and_sync(lora_sync_path, inference_engine_client, lora_name=lora_name)
-            if cache_reset_task is not None:
-                await cache_reset_task
-            if self.cfg.placement.colocate_all:
+            try:
                 torch.cuda.empty_cache()
-            torch.distributed.barrier()
+                lora_name, lora_sync_path = self._resolve_lora_sync_target(model_id)
+                if self._lora_sync_mode_is_memory():
+                    await self._publish_lora_adapter_in_memory(lora_name, inference_engine_client)
+                else:
+                    await self._save_lora_adapters_and_sync(
+                        lora_sync_path, inference_engine_client, lora_name=lora_name
+                    )
+                cache_error: Optional[BaseException] = None
+                if cache_reset_task is not None:
+                    try:
+                        await self._await_prefix_cache_reset(cache_reset_task)
+                    except (Exception, asyncio.CancelledError) as exc:
+                        cache_error = exc
+                    finally:
+                        cache_reset_task = None
+                if self.cfg.placement.colocate_all:
+                    torch.cuda.empty_cache()
+                barrier_with_error_propagation(cache_error, stage="prefix cache reset")
+            except PeerRankSyncError:
+                return
+            finally:
+                await cleanup_unawaited_task(cache_reset_task)
             return
 
         await self._sync_weights_to_inference_engines(inference_engine_client, inference_engine_cfg)
@@ -2289,7 +2486,14 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         # ranks no-op. All ranks run delete_adapter (pass_through dispatch), so
         # the predicate's one-time collective is safe here even before the
         # first sync. Best-effort — log on failure but don't propagate.
-        if self._is_lora_sync_writer_rank():
+        try:
+            is_writer = self._is_lora_sync_writer_rank()
+        except PeerRankSyncError:
+            return
+        except OSError as e:
+            logger.warning(f"Failed to resolve lora_sync writer rank during delete_adapter: {e}")
+            return
+        if is_writer:
             _, lora_sync_path = self._resolve_lora_sync_target(model_id)
             base_sync_path = self.cfg.policy.model.lora.lora_sync_path
             if lora_sync_path != base_sync_path:

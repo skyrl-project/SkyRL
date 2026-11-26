@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import socket
+import time
 from collections import defaultdict
 from contextlib import contextmanager
 from ctypes import CDLL, POINTER, Structure, c_char_p, c_int, c_ulong, c_void_p
@@ -63,8 +64,11 @@ from skyrl.backends.skyrl_train.utils.torch_utils import masked_mean
 from skyrl.backends.skyrl_train.workers.worker_utils import (
     BaseBatchIterator,
     BatchIterator,
+    PeerRankSyncError,
     TokenBasedBatchIterator,
     all_reduce_metrics,
+    barrier_with_error_propagation,
+    cleanup_unawaited_task,
     compute_minibatch_rollout_logprob_diff_metrics,
     get_microbatch_iterator,
     reduce_metrics,
@@ -644,6 +648,19 @@ class Worker(DistributedTorchRayActor):
 
         return asyncio.to_thread(run)
 
+    async def _await_weight_sync_thread(self, fn: Callable, *args, **kwargs):
+        """Run ``fn`` via ``_weight_sync_thread`` and drain it before propagating cancellation."""
+        fut = asyncio.ensure_future(self._weight_sync_thread(fn, *args, **kwargs))
+        cancelled = False
+        while not fut.done():
+            try:
+                await asyncio.wait({fut})
+            except asyncio.CancelledError:
+                cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError() from fut.exception()
+        return fut.result()
+
     def _should_reset_prefix_cache(self, inference_engine_cfg) -> bool:
         """Whether this sync should clear the inference engines' prefix cache.
 
@@ -666,6 +683,26 @@ class Worker(DistributedTorchRayActor):
             return None
         return inference_engine_client.reset_prefix_cache(reset_running_requests=True)
 
+    async def _await_prefix_cache_reset(self, cache_reset_task, *, deadline_at: Optional[float] = None) -> None:
+        """Await ``cache_reset_task`` within a budget strictly below the worker PG timeout."""
+        from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
+            control_plane_timeout_budget,
+            rank0_phase_timeout_s,
+        )
+
+        if deadline_at is not None:
+            remaining = deadline_at - time.monotonic()
+            if remaining <= 0.0:
+                raise asyncio.TimeoutError("Prefix cache reset skipped: weight-sync phase deadline already expired")
+            budget = remaining
+        else:
+            budget = rank0_phase_timeout_s()
+        with control_plane_timeout_budget(budget if budget > 0 else None):
+            if budget > 0:
+                await asyncio.wait_for(cache_reset_task, timeout=budget)
+            else:
+                await cache_reset_task
+
     async def _sync_weights_to_inference_engines(
         self,
         inference_engine_client,
@@ -682,6 +719,12 @@ class Worker(DistributedTorchRayActor):
         * the ``expandable_segments`` toggle, a trainer-process allocator setting;
         * ``empty_cache`` afterwards.
         """
+        from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
+            rank0_phase_timeout_s,
+        )
+        from skyrl.backends.skyrl_train.weight_sync.control_plane import (
+            weight_sync_client_deadline,
+        )
         from skyrl.backends.skyrl_train.weight_sync.weight_senders import (
             maybe_set_reset_prefix_cache,
         )
@@ -693,24 +736,47 @@ class Worker(DistributedTorchRayActor):
         if not engine.skyrl_handles_prefix_cache_reset:
             cache_reset_task = self._reset_prefix_cache_task(inference_engine_client, inference_engine_cfg)
 
-        torch.cuda.empty_cache()
-
-        # Under colocate_all the CUDA-IPC path calls cudaIpcGetMemHandle, which
-        # is incompatible with the VMM addresses expandable segments use; some
-        # engines (sharded_rdt) share GPU memory on every run and ask for the
-        # toggle unconditionally.
-        with self._expandable_segments_disabled_for_sync(force=engine.skyrl_force_disable_expandable_segments):
-            await self._weight_sync_thread(engine.send_weights)
-
-        if cache_reset_task is not None:
-            await cache_reset_task
-        # An engine whose send buffers are reused next step declares
-        # empty_cache_after_send=False: scrubbing them back to CUDA costs
-        # 0.25-0.53s per rank at 235B and buys nothing. Under colocation an
-        # inference engine wants the physical memory, so empty regardless.
-        if engine.skyrl_empty_cache_after_send or self.cfg.placement.colocate_all:
+        try:
             torch.cuda.empty_cache()
-        torch.distributed.barrier()
+
+            # Under colocate_all the CUDA-IPC path calls cudaIpcGetMemHandle, which
+            # is incompatible with the VMM addresses expandable segments use; some
+            # engines (sharded_rdt) share GPU memory on every run and ask for the
+            # toggle unconditionally.
+            sync_error: Optional[BaseException] = None
+            phase_budget = rank0_phase_timeout_s()
+            phase_deadline = time.monotonic() + phase_budget if phase_budget > 0 else None
+            with (
+                self._expandable_segments_disabled_for_sync(force=engine.skyrl_force_disable_expandable_segments),
+                weight_sync_client_deadline(phase_deadline),
+            ):
+                try:
+                    await self._await_weight_sync_thread(engine.send_weights)
+                except PeerRankSyncError:
+                    # Peer rank failed inside coordinated send_weights; enter the
+                    # trailing barrier with local_error=None to stay in lockstep.
+                    pass
+                except (Exception, asyncio.CancelledError) as exc:
+                    sync_error = exc
+
+            if sync_error is None and cache_reset_task is not None:
+                try:
+                    await self._await_prefix_cache_reset(cache_reset_task, deadline_at=phase_deadline)
+                except (Exception, asyncio.CancelledError) as exc:
+                    sync_error = exc
+                finally:
+                    cache_reset_task = None
+            # An engine whose send buffers are reused next step declares
+            # empty_cache_after_send=False: scrubbing them back to CUDA costs
+            # 0.25-0.53s per rank at 235B and buys nothing. Under colocation an
+            # inference engine wants the physical memory, so empty regardless.
+            if engine.skyrl_empty_cache_after_send or self.cfg.placement.colocate_all:
+                torch.cuda.empty_cache()
+            barrier_with_error_propagation(sync_error, stage="weight sync")
+        except PeerRankSyncError:
+            return
+        finally:
+            await cleanup_unawaited_task(cache_reset_task)
 
     def forward(self, *args, **kwargs) -> WorkerOutput:
         """Run forward pass on the input batch.

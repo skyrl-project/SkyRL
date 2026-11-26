@@ -97,40 +97,141 @@ class SkyrlDraftSessionMixin:
 _TRAINER_ENGINE_CACHE: dict[str, tuple[type, type]] = {}
 
 
+def _coordinate_rank_error(local_error: Optional[BaseException], *, stage: str) -> None:
+    """Propagate a rank-subset error across all ranks when a process group is initialized."""
+    import torch.distributed as dist
+
+    from skyrl.backends.skyrl_train.workers.worker_utils import (
+        barrier_with_error_propagation,
+    )
+
+    if dist.is_available() and dist.is_initialized():
+        barrier_with_error_propagation(local_error, stage=stage)
+    elif local_error is not None:
+        raise local_error
+
+
 def _build_skyrl_nccl_trainer() -> "tuple[type, type]":
-    """vLLM's NCCL trainer engine plus the SkyRL capability declarations.
+    """vLLM's NCCL trainer engine plus SkyRL capability declarations and error coordination.
 
     A new backend key rather than a shadow of ``nccl``: ``register_engine``
     refuses a duplicate name, and the factory dispatches on the init info's
     ``backend`` ClassVar, so the subclassed init info carries the new key.
     """
+    from concurrent.futures import ThreadPoolExecutor
+    from dataclasses import asdict
+
     from vllm.distributed.weight_transfer.nccl_engine import (
         NCCLTrainerInitInfo,
         NCCLTrainerWeightTransferEngine,
+        NCCLWeightTransferUpdateInfo,
     )
 
     @dataclass
     class SkyrlNCCLTrainerInitInfo(NCCLTrainerInitInfo):
         backend: ClassVar[str] = SKYRL_NCCL_TRAINER_BACKEND
 
-    class SkyrlNCCLTrainerWeightTransferEngine(
-        SkyrlDraftSessionMixin, SkyrlTrainerCapabilities, NCCLTrainerWeightTransferEngine
-    ):
-        init_info_cls = SkyrlNCCLTrainerInitInfo
+    class _SkyrlCoordinatedNCCLSendMixin:
+        """Keep all trainer ranks aligned across NCCL's start / update / finish RPCs.
+
+        Upstream ``NCCLTrainerWeightTransferEngine.send_weights`` lets non-sender
+        ranks enter ``_broadcast(source, meta)`` (driving FSDP/Megatron gather
+        collectives) before rank 0's ``start_weight_update()`` succeeds, and lets
+        non-sender ranks proceed to a following draft session if rank 0 fails in
+        ``finish_weight_update()``. Coordinating rank-0 RPC errors via
+        ``barrier_with_error_propagation`` prevents peer ranks from stranding in
+        export collectives.
+        """
 
         def send_weights(self) -> None:
+            assert self.source is not None
+            source = self.source
             # Since vLLM 0.33 a round whose metadata equals the previous one ships an empty update info,
             # and the worker reuses the info it cached under its `self.model`. SkyRL's receivers swap in
             # a per-round proxy as `self.model` (FP8 load proxy, LoRA staging), so that lookup misses, the
             # worker receives nothing and the trainer's broadcast hangs. Always ship the names.
             self._sent_meta = None
-            super().send_weights()
+
+            meta = source.metadata
+
+            start_error: Optional[BaseException] = None
+            exe: Optional[ThreadPoolExecutor] = None
+            future = None
+            if self.is_sender:
+                update_info = NCCLWeightTransferUpdateInfo(
+                    names=[m.name for m in meta],
+                    dtype_names=[str(m.dtype).split(".")[-1] for m in meta],
+                    shapes=[list(m.shape) for m in meta],
+                )
+                try:
+                    self.client.start_weight_update()
+                    exe = ThreadPoolExecutor(max_workers=1)
+                    future = exe.submit(self.client.update_weights, asdict(update_info))
+                    if future.done():
+                        future.result()
+                except Exception as exc:
+                    start_error = exc
+                    if exe is not None:
+                        exe.shutdown(wait=False)
+                        exe = None
+                        future = None
+
+            # Coordinate rank-0 setup BEFORE any rank enters _broadcast()'s
+            # source.iter_full() gather collectives. Re-check future.done() right
+            # after the first exchange in case /update_weights rejected while the
+            # exchange was in flight.
+            try:
+                _coordinate_rank_error(start_error, stage="NCCL start_weight_update")
+                update_reject_error: Optional[BaseException] = None
+                if self.is_sender and future is not None and future.done():
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        update_reject_error = exc
+                _coordinate_rank_error(update_reject_error, stage="NCCL update_weights")
+            except BaseException:
+                if exe is not None:
+                    exe.shutdown(wait=False)
+                raise
+
+            post_error: Optional[BaseException] = None
+            if not self.is_sender:
+                try:
+                    self._broadcast(source, meta)
+                    self._post_send_sync()
+                except Exception as exc:
+                    post_error = exc
+                _coordinate_rank_error(post_error, stage="NCCL send_weights")
+                return
+
+            assert exe is not None and future is not None
+            try:
+                try:
+                    self._broadcast(source, meta)
+                    future.result()  # surface inference-side errors
+                finally:
+                    exe.shutdown(wait=False)
+                self.client.finish_weight_update()
+                self._sent_meta = meta
+                self._post_send_sync()
+            except Exception as exc:
+                post_error = exc
+            _coordinate_rank_error(post_error, stage="NCCL send_weights")
+
+    class SkyrlNCCLTrainerWeightTransferEngine(
+        SkyrlDraftSessionMixin,
+        SkyrlTrainerCapabilities,
+        _SkyrlCoordinatedNCCLSendMixin,
+        NCCLTrainerWeightTransferEngine,
+    ):
+        init_info_cls = SkyrlNCCLTrainerInitInfo
 
     return SkyrlNCCLTrainerInitInfo, SkyrlNCCLTrainerWeightTransferEngine
 
 
 def _build_skyrl_ipc_trainer() -> "tuple[type, type]":
-    """vLLM's IPC trainer engine plus the SkyRL capability declarations."""
+    """vLLM's IPC trainer engine plus the SkyRL capability declarations and error coordination."""
+    import torch
     from vllm.distributed.weight_transfer.ipc_engine import (
         IPCTrainerInitInfo,
         IPCTrainerWeightTransferEngine,
@@ -140,8 +241,77 @@ def _build_skyrl_ipc_trainer() -> "tuple[type, type]":
     class SkyrlIPCTrainerInitInfo(IPCTrainerInitInfo):
         backend: ClassVar[str] = SKYRL_IPC_TRAINER_BACKEND
 
+    class _SkyrlCoordinatedIPCSendMixin:
+        """Keep all trainer ranks aligned across IPC's start / update / finish RPCs.
+
+        Upstream ``IPCTrainerWeightTransferEngine.send_weights`` calls rank-0
+        ``start_weight_update`` before the handle ``all_gather_object``, calls
+        rank-0 ``update_weights`` before each per-chunk barrier, and calls rank-0
+        ``finish_weight_update`` before ``_post_send_sync``'s barrier. Coordinating
+        rank-0 RPC failures at each boundary ensures peer ranks never diverge into
+        incompatible collectives or time out in ``barrier()``.
+        """
+
+        _skyrl_send_error: Optional[BaseException] = None
+
+        def _do_send(self, *args, **kwargs) -> None:
+            if not self.is_sender:
+                return
+            try:
+                super()._do_send(*args, **kwargs)
+            except Exception as exc:
+                # Defer raising until the immediately following sync barrier
+                # (_post_send_sync in packed mode, or send_weights in unpacked mode).
+                self._skyrl_send_error = exc
+
+        def _post_send_sync(self) -> None:
+            err = self._skyrl_send_error
+            self._skyrl_send_error = None
+            try:
+                _coordinate_rank_error(err, stage="IPC update_weights")
+            finally:
+                if torch.cuda.is_available():
+                    torch.cuda.ipc_collect()
+
+        def send_weights(self) -> None:
+            assert self.source is not None
+            source = self.source
+            self._skyrl_send_error = None
+
+            start_error: Optional[BaseException] = None
+            if self.is_sender:
+                try:
+                    self.client.start_weight_update()
+                except Exception as exc:
+                    start_error = exc
+            # Coordinate start_weight_update BEFORE any rank enters _send()'s handle all_gather.
+            _coordinate_rank_error(start_error, stage="IPC start_weight_update")
+
+            weight_refs = None
+            try:
+                weight_refs = self._send(source)
+                # In unpacked mode, _do_send deferred any error without calling _post_send_sync.
+                update_error = self._skyrl_send_error
+                self._skyrl_send_error = None
+                _coordinate_rank_error(update_error, stage="IPC update_weights")
+
+                finish_error: Optional[BaseException] = None
+                if self.is_sender:
+                    try:
+                        self.client.finish_weight_update()
+                    except Exception as exc:
+                        finish_error = exc
+                _coordinate_rank_error(finish_error, stage="IPC finish_weight_update")
+            finally:
+                if torch.cuda.is_available():
+                    torch.cuda.ipc_collect()
+                del weight_refs
+
     class SkyrlIPCTrainerWeightTransferEngine(
-        SkyrlDraftSessionMixin, SkyrlTrainerCapabilities, IPCTrainerWeightTransferEngine
+        SkyrlDraftSessionMixin,
+        SkyrlTrainerCapabilities,
+        _SkyrlCoordinatedIPCSendMixin,
+        IPCTrainerWeightTransferEngine,
     ):
         init_info_cls = SkyrlIPCTrainerInitInfo
 

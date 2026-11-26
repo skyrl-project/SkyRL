@@ -51,13 +51,17 @@ import contextlib
 import json
 import logging
 import time
+import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import (
     Any,
     AsyncIterator,
+    Coroutine,
     Dict,
     Iterable,
+    Iterator,
     List,
     Literal,
     Optional,
@@ -92,6 +96,7 @@ from skyrl.env_vars import (
     SKYRL_GENERATE_CONCURRENCY_PER_ENGINE,
     SKYRL_HTTP_CONNECTION_LIMIT,
     SKYRL_INFERENCE_CONTROL_PLANE_TIMEOUT_S,
+    SKYRL_WORKER_NCCL_TIMEOUT_IN_S,
 )
 from skyrl.train.utils import deadline
 
@@ -168,18 +173,169 @@ class InferenceServerTimeoutError(RuntimeError):
         )
 
 
+_CONTROL_PLANE_PHASE_TIMEOUT_S: ContextVar[Optional[float]] = ContextVar("_CONTROL_PLANE_PHASE_TIMEOUT_S", default=None)
+
+
+def rank0_phase_timeout_s(pg_timeout_s: Optional[float] = None) -> float:
+    """Return a rank-0 control-plane phase budget strictly below the worker PG timeout.
+
+    Ensures rank-0 HTTP fan-out plus any rollback finishes and reaches
+    ``barrier_with_error_propagation`` before peer ranks time out in Gloo
+    ``all_gather_object``.
+    """
+    pg_s = float(SKYRL_WORKER_NCCL_TIMEOUT_IN_S if pg_timeout_s is None else pg_timeout_s)
+    if pg_s <= 0:
+        return 0.0
+    if pg_s > 40.0:
+        return min(pg_s - 30.0, pg_s * 0.8)
+    return max(0.1, pg_s * 0.6)
+
+
+@contextlib.contextmanager
+def control_plane_timeout_budget(timeout_s: Optional[float]) -> Iterator[None]:
+    """Bound control-plane fan-out and rollback inside this block to ``timeout_s``."""
+    token = _CONTROL_PLANE_PHASE_TIMEOUT_S.set(timeout_s)
+    try:
+        yield
+    finally:
+        _CONTROL_PLANE_PHASE_TIMEOUT_S.reset(token)
+
+
+async def _run_bounded_fanout(
+    calls: List[Tuple[str, Coroutine[Any, Any, Any]]],
+    *,
+    budget_s: Optional[float],
+    method: str,
+    endpoint: str,
+) -> Tuple[Dict[str, Any], Dict[str, BaseException], bool]:
+    """Run per-server coroutines concurrently, bounded strictly by ``budget_s``.
+
+    Returns ``(responses, errors, was_cancelled)`` with every task settled (or
+    cancelled and drained on budget expiry) before returning.
+    """
+    if not calls:
+        return {}, {}, False
+
+    deadline_at = None if (budget_s is None or budget_s <= 0) else (time.monotonic() + budget_s)
+    tasks: Dict[asyncio.Task[Any], str] = {asyncio.create_task(coro): url for url, coro in calls}
+    pending = set(tasks.keys())
+    cancelled = False
+
+    while pending:
+        remaining = None if deadline_at is None else max(0.0, deadline_at - time.monotonic())
+        if remaining is not None and remaining <= 0.0:
+            break
+        try:
+            done, pending = await asyncio.wait(pending, timeout=remaining)
+            if not done and deadline_at is not None and time.monotonic() >= deadline_at:
+                break
+        except asyncio.CancelledError:
+            cancelled = True
+
+    timed_out_urls: Dict[str, BaseException] = {}
+    if pending:
+        for task in pending:
+            url = tasks[task]
+            timed_out_urls[url] = InferenceServerTimeoutError(method, f"{url}{endpoint}", budget_s or 0.0)
+            task.cancel()
+        cancelling = set(pending)
+        while cancelling:
+            try:
+                _, cancelling = await asyncio.wait(cancelling)
+            except asyncio.CancelledError:
+                cancelled = True
+
+    responses: Dict[str, Any] = {}
+    errors: Dict[str, BaseException] = {}
+    for task, url in tasks.items():
+        if url in timed_out_urls:
+            errors[url] = timed_out_urls[url]
+            continue
+        if task.cancelled():
+            errors[url] = asyncio.CancelledError()
+            continue
+        exc = task.exception()
+        if exc is not None:
+            errors[url] = exc
+        else:
+            _, resp = task.result()
+            responses[url] = resp
+
+    return responses, errors, cancelled
+
+
 @contextlib.asynccontextmanager
 async def _control_plane_request(
-    session: aiohttp.ClientSession, method: str, url: str, **kwargs: Any
+    session: aiohttp.ClientSession,
+    method: str,
+    url: str,
+    *,
+    connect_only: bool = False,
+    **kwargs: Any,
 ) -> AsyncIterator[aiohttp.ClientResponse]:
-    """``session.request`` bounded by ``SKYRL_INFERENCE_CONTROL_PLANE_TIMEOUT_S``."""
+    """``session.request`` bounded by ``SKYRL_INFERENCE_CONTROL_PLANE_TIMEOUT_S`` and any active phase budget.
+
+    When ``connect_only=True``, applies only ``sock_connect`` timeout (no read
+    timeout) so the HTTP connection stays open until the server confirms
+    completion of a stateful endpoint while the caller enforces its phase
+    deadline externally.
+    """
     timeout_s = SKYRL_INFERENCE_CONTROL_PLANE_TIMEOUT_S
-    timeout = aiohttp.ClientTimeout(total=timeout_s if timeout_s > 0 else None)
+    phase_budget_s = _CONTROL_PLANE_PHASE_TIMEOUT_S.get()
+    if phase_budget_s is not None and phase_budget_s > 0:
+        timeout_s = min(timeout_s, phase_budget_s) if timeout_s > 0 else phase_budget_s
+    if connect_only:
+        connect_s = min(10.0, timeout_s) if timeout_s > 0 else None
+        timeout = aiohttp.ClientTimeout(total=None, sock_connect=connect_s)
+    else:
+        timeout = aiohttp.ClientTimeout(total=timeout_s if timeout_s > 0 else None)
     try:
         async with session.request(method, url, timeout=timeout, **kwargs) as resp:
             yield resp
     except asyncio.TimeoutError:
         raise InferenceServerTimeoutError(method, url, timeout_s) from None
+
+
+def _is_unconfirmed_async_transport_error(exc: BaseException) -> bool:
+    """Return True when ``exc`` may have left an async server-side LoRA load executing without confirmation."""
+    import socket
+
+    if isinstance(exc, InferenceServerHTTPError):
+        return False
+    if isinstance(exc, (ConnectionRefusedError, socket.gaierror)):
+        return False
+    if isinstance(exc, aiohttp.ClientConnectorError):
+        os_err = getattr(exc, "os_error", None)
+        if isinstance(os_err, (ConnectionRefusedError, socket.gaierror)):
+            return False
+        return True
+    if isinstance(
+        exc,
+        (
+            InferenceServerTimeoutError,
+            TimeoutError,
+            asyncio.TimeoutError,
+            aiohttp.ServerTimeoutError,
+            aiohttp.ServerDisconnectedError,
+            aiohttp.ClientOSError,
+            aiohttp.ClientConnectionError,
+            ConnectionError,
+            OSError,
+        ),
+    ):
+        return True
+    return False
+
+
+async def drain_client_pending_lora_loads(client: Any, *, timeout_s: Optional[float] = None) -> List[str]:
+    """Drain any unresolved ``load_lora_adapter`` requests tracked on a real ``RemoteInferenceClient``."""
+    if not isinstance(client, RemoteInferenceClient):
+        return []
+    inflight = client.__dict__.get("_inflight_lora_loads")
+    unconfirmed = client.__dict__.get("_unconfirmed_lora_loads")
+    if not inflight and not unconfirmed:
+        return []
+    return await client.drain_pending_lora_loads(timeout_s=timeout_s)
 
 
 async def _read_json_body(resp: aiohttp.ClientResponse) -> Any:
@@ -1245,9 +1401,16 @@ class RemoteInferenceClient(InferenceEngineInterface):
         """
         with deadline.operation(endpoint):
             results = await asyncio.gather(
-                *[self._call_server(url, endpoint, json, method, params) for url in self.server_urls]
+                *[self._call_server(url, endpoint, json, method, params) for url in self.server_urls],
+                return_exceptions=True,
             )
-        return {url: resp for url, resp in results}
+        responses = {}
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+            url, resp = result
+            responses[url] = resp
+        return responses
 
     async def pause(self, mode: Union[PauseMode, str] = PauseMode.KEEP, clear_cache: bool = False) -> Dict[str, Any]:
         """
@@ -1502,7 +1665,187 @@ class RemoteInferenceClient(InferenceEngineInterface):
     # What is left here is what the driver drives: pause/resume, prefix-cache
     # reset, /fetch_weights, LoRA, and /get_world_size at init.
 
-    async def set_lora_receive_target(self, receive_target: Dict[str, Any]) -> Dict[str, Any]:
+    def _dirty_lora_rounds(self) -> Dict[str, set[str]]:
+        dirty = getattr(self, "_dirty_lora_target_rounds", None)
+        if dirty is None:
+            dirty = {}
+            self._dirty_lora_target_rounds = dirty
+        return dirty
+
+    def _dirty_lora_servers(self) -> set[str]:
+        return {url for url, rounds in self._dirty_lora_rounds().items() if rounds}
+
+    def mark_lora_servers_dirty(
+        self,
+        server_urls: Optional[List[str]] = None,
+        *,
+        round_id: Optional[str] = None,
+    ) -> None:
+        """Mark servers as requiring a preflight disarm before the next LoRA arm."""
+        urls = list(self.server_urls if server_urls is None else server_urls)
+        effective_round = round_id if round_id is not None else getattr(self, "_last_lora_round_id", None)
+        round_key = effective_round if effective_round is not None else ""
+        dirty = self._dirty_lora_rounds()
+        for url in urls:
+            dirty.setdefault(url, set()).add(round_key)
+
+    def _resolve_lora_phase_budget(self, timeout_s: Optional[float]) -> Optional[float]:
+        """Return a total phase budget strictly below the worker PG timeout."""
+        budget = timeout_s if timeout_s is not None else _CONTROL_PLANE_PHASE_TIMEOUT_S.get()
+        if budget is not None:
+            return budget if budget > 0 else None
+        pg_budget = rank0_phase_timeout_s()
+        if SKYRL_INFERENCE_CONTROL_PLANE_TIMEOUT_S > 0 and pg_budget > 0:
+            return min(SKYRL_INFERENCE_CONTROL_PLANE_TIMEOUT_S, pg_budget)
+        if pg_budget > 0:
+            return pg_budget
+        return SKYRL_INFERENCE_CONTROL_PLANE_TIMEOUT_S if SKYRL_INFERENCE_CONTROL_PLANE_TIMEOUT_S > 0 else None
+
+    async def _clear_lora_receive_target_bounded(
+        self,
+        server_urls: List[str],
+        *,
+        round_id: Optional[str],
+        budget_s: Optional[float],
+    ) -> Tuple[Dict[str, BaseException], bool]:
+        if not server_urls:
+            return {}, False
+        payload: Dict[str, Any] = {"method": "skyrl_clear_lora_receive_target"}
+        if round_id is not None:
+            payload["kwargs"] = {"round_id": round_id}
+        with control_plane_timeout_budget(budget_s):
+            responses, errors, cancelled = await _run_bounded_fanout(
+                [(url, self._call_server(url, "/collective_rpc", payload)) for url in server_urls],
+                budget_s=budget_s,
+                method="POST",
+                endpoint="/collective_rpc",
+            )
+        dirty = self._dirty_lora_rounds()
+        round_key = round_id if round_id is not None else ""
+        for url in responses:
+            if url in dirty:
+                if round_id is None:
+                    dirty.pop(url, None)
+                else:
+                    dirty[url].discard(round_key)
+                    if not dirty[url]:
+                        dirty.pop(url, None)
+        for url in errors:
+            dirty.setdefault(url, set()).add(round_key)
+        if errors:
+            details = ", ".join(f"{url}: {type(exc).__name__}: {exc}" for url, exc in errors.items())
+            logger.warning(
+                f"Failed to clear LoRA receive target on {len(errors)}/{len(server_urls)} server(s): {details}"
+            )
+        return errors, cancelled
+
+    async def clear_lora_receive_target(
+        self,
+        server_urls: Optional[List[str]] = None,
+        *,
+        round_id: Optional[str] = None,
+        timeout_s: Optional[float] = None,
+    ) -> Dict[str, BaseException]:
+        """Disarm LoRA receive targets within ``timeout_s`` and return any per-server errors.
+
+        When ``round_id`` is omitted, uses the most recently armed round token
+        (if any) so delayed clears cannot disarm a newer tenant's round. Servers
+        whose clear fails or times out are tracked so the next
+        ``set_lora_receive_target`` requires a successful disarm before arming again.
+        """
+        urls = list(self.server_urls if server_urls is None else server_urls)
+        effective_round = round_id if round_id is not None else getattr(self, "_last_lora_round_id", None)
+        budget_s = self._resolve_lora_phase_budget(timeout_s)
+        errors, cancelled = await self._clear_lora_receive_target_bounded(
+            urls, round_id=effective_round, budget_s=budget_s
+        )
+        if cancelled:
+            raise asyncio.CancelledError()
+        return errors
+
+    def _next_lora_round_id(self) -> str:
+        """Generate a per-client monotonic ``<client_id>:<seq>`` round token."""
+        client_id = getattr(self, "_lora_client_id", None)
+        if not client_id:
+            client_id = uuid.uuid4().hex
+            self._lora_client_id = client_id
+        seq = getattr(self, "_lora_round_seq", 0) + 1
+        self._lora_round_seq = seq
+        return f"{client_id}:{seq}"
+
+    def _inflight_lora_load_entries(self) -> List[Tuple[str, str, asyncio.Task[Any]]]:
+        entries = getattr(self, "_inflight_lora_loads", None)
+        if entries is None:
+            entries = []
+            self._inflight_lora_loads = entries
+        return entries
+
+    def _unconfirmed_lora_load_entries(self) -> List[str]:
+        entries = getattr(self, "_unconfirmed_lora_loads", None)
+        if entries is None:
+            entries = []
+            self._unconfirmed_lora_loads = entries
+        return entries
+
+    def _record_unconfirmed_lora_load(self, url: str, lora_name: str, exc: BaseException) -> None:
+        entry = f"{url}/skyrl/v1/load_lora_adapter ({lora_name}: unconfirmed {type(exc).__name__})"
+        entries = self._unconfirmed_lora_load_entries()
+        if entry not in entries:
+            entries.append(entry)
+
+    def _prune_done_lora_loads(self) -> List[Tuple[str, str, asyncio.Task[Any]]]:
+        """Remove completed load tasks and classify any unconfirmed transport errors."""
+        active: List[Tuple[str, str, asyncio.Task[Any]]] = []
+        entries = self._inflight_lora_load_entries()
+        for entry in entries:
+            url, lora_name, task = entry
+            if task.done():
+                if not task.cancelled():
+                    exc = task.exception()
+                    if exc is not None and _is_unconfirmed_async_transport_error(exc):
+                        self._record_unconfirmed_lora_load(url, lora_name, exc)
+            else:
+                active.append(entry)
+        entries[:] = active
+        return active
+
+    async def drain_pending_lora_loads(self, timeout_s: Optional[float] = None) -> List[str]:
+        """Wait up to ``timeout_s`` for any timed-out ``load_lora_adapter`` tasks to settle.
+
+        Returns descriptions of still-running or unconfirmed loads (empty when all
+        prior loads have confirmed server completion).
+        """
+        budget_s = self._resolve_lora_phase_budget(timeout_s)
+        deadline_at = None if (budget_s is None or budget_s <= 0) else (time.monotonic() + budget_s)
+        cancelled = False
+        while True:
+            active = self._prune_done_lora_loads()
+            if not active:
+                break
+            remaining = None if deadline_at is None else max(0.0, deadline_at - time.monotonic())
+            if remaining is not None and remaining <= 0.0:
+                break
+            try:
+                done, _ = await asyncio.wait([t for _, _, t in active], timeout=remaining)
+                if not done and deadline_at is not None and time.monotonic() >= deadline_at:
+                    break
+            except asyncio.CancelledError:
+                cancelled = True
+                break
+        active = self._prune_done_lora_loads()
+        unresolved = [f"{url}/skyrl/v1/load_lora_adapter ({name})" for url, name, _ in active] + list(
+            self._unconfirmed_lora_load_entries()
+        )
+        if cancelled:
+            raise asyncio.CancelledError()
+        return unresolved
+
+    async def set_lora_receive_target(
+        self,
+        receive_target: Dict[str, Any],
+        *,
+        timeout_s: Optional[float] = None,
+    ) -> Dict[str, Any]:
         """Arm every inference worker's receive engine for one LoRA adapter round.
 
         ``lora.sync_mode=memory`` ships a PEFT adapter down the ordinary weight
@@ -1510,11 +1853,105 @@ class RemoteInferenceClient(InferenceEngineInterface):
         The adapter's name, config and alias map travel here instead, over
         ``/collective_rpc``, and must land before the trainer calls
         ``send_weights()`` (see ``weight_sync/lora_target.py``).
+
+        Each call stamps a unique ``round_id`` token so rollbacks and preflight
+        clears are conditional on that round and servers reject late arms from
+        cancelled rounds. The entire phase (preflight disarm, arm fan-out, and
+        rollback on failure/cancellation) is bounded strictly below the worker
+        process-group timeout so peer ranks never time out in Gloo while waiting
+        for rank 0's error exchange.
         """
-        return await self._call_all_servers(
-            "/collective_rpc",
-            {"method": "skyrl_set_lora_receive_target", "kwargs": {"receive_target": receive_target}},
-        )
+        total_budget = self._resolve_lora_phase_budget(timeout_s)
+        phase_deadline = None if total_budget is None else (time.monotonic() + total_budget)
+        cancelled = False
+
+        # Ensure any prior timed-out load_lora_adapter has confirmed server
+        # completion before arming a new round.
+        load_drain_budget = None if phase_deadline is None else max(0.05, (phase_deadline - time.monotonic()) * 0.3)
+        unresolved_loads = await self.drain_pending_lora_loads(timeout_s=load_drain_budget)
+        if unresolved_loads:
+            raise InferenceServerTimeoutError(
+                "POST",
+                f"Cannot arm LoRA receive target {receive_target.get('lora_name')!r}: prior load_lora_adapter "
+                f"still in flight or unconfirmed: {', '.join(unresolved_loads)}",
+                total_budget or 0.0,
+            )
+
+        # Require successful bounded cleanup of any server whose prior disarm failed
+        # before arming any server for a new tenant.
+        dirty = self._dirty_lora_rounds()
+        pending_rounds_by_id: Dict[Optional[str], List[str]] = {}
+        for url in self.server_urls:
+            for dirty_round in list(dirty.get(url, ())):
+                rid = dirty_round or None
+                pending_rounds_by_id.setdefault(rid, []).append(url)
+        if pending_rounds_by_id:
+            preflight_errors: Dict[str, BaseException] = {}
+            for dirty_rid, urls in pending_rounds_by_id.items():
+                preflight_budget = (
+                    None if phase_deadline is None else max(0.05, (phase_deadline - time.monotonic()) * 0.4)
+                )
+                errs, pf_cancelled = await self._clear_lora_receive_target_bounded(
+                    urls, round_id=dirty_rid, budget_s=preflight_budget
+                )
+                cancelled = cancelled or pf_cancelled
+                preflight_errors.update(errs)
+            if preflight_errors:
+                details = ", ".join(f"{url}: {type(exc).__name__}: {exc}" for url, exc in preflight_errors.items())
+                err = RuntimeError(
+                    f"Cannot arm LoRA receive target {receive_target.get('lora_name')!r}: "
+                    f"prior disarm still failing on {len(preflight_errors)} server(s): {details}"
+                )
+                if cancelled:
+                    raise asyncio.CancelledError() from err
+                raise err
+            if cancelled:
+                raise asyncio.CancelledError()
+
+        if phase_deadline is None:
+            arm_budget = None
+        else:
+            remaining = max(0.05, phase_deadline - time.monotonic())
+            rollback_reserve = min(remaining * 0.25, 30.0)
+            arm_budget = max(0.05, remaining - rollback_reserve)
+
+        target_with_round = dict(receive_target)
+        round_id = str(target_with_round.get("round_id") or self._next_lora_round_id())
+        target_with_round["round_id"] = round_id
+        self._last_lora_round_id = round_id
+
+        payload = {"method": "skyrl_set_lora_receive_target", "kwargs": {"receive_target": target_with_round}}
+        with deadline.operation("/collective_rpc"), control_plane_timeout_budget(arm_budget):
+            responses, errors, arm_cancelled = await _run_bounded_fanout(
+                [(url, self._call_server(url, "/collective_rpc", payload)) for url in self.server_urls],
+                budget_s=arm_budget,
+                method="POST",
+                endpoint="/collective_rpc",
+            )
+        cancelled = cancelled or arm_cancelled
+        first_error = next(iter(errors.values()), None)
+
+        if cancelled or first_error is not None:
+            # Disarm every contacted server for this round_id within the remaining
+            # phase budget so rollback never pushes rank 0 past the worker PG timeout
+            # and a delayed clear cannot affect a later round.
+            rollback_budget = None if phase_deadline is None else max(0.05, phase_deadline - time.monotonic())
+            clear_errors, clear_cancelled = await self._clear_lora_receive_target_bounded(
+                list(self.server_urls), round_id=round_id, budget_s=rollback_budget
+            )
+            cancelled = cancelled or clear_cancelled
+            if clear_errors and first_error is not None:
+                details = ", ".join(f"{url}: {type(exc).__name__}: {exc}" for url, exc in clear_errors.items())
+                first_error.add_note(
+                    f"Rollback skyrl_clear_lora_receive_target also failed on {len(clear_errors)} server(s): {details}"
+                )
+            if cancelled:
+                if first_error is None and clear_errors:
+                    first_error = next(iter(clear_errors.values()))
+                raise asyncio.CancelledError() from first_error
+            assert first_error is not None
+            raise first_error
+        return responses
 
     async def load_lora_adapter(
         self,
@@ -1555,6 +1992,18 @@ class RemoteInferenceClient(InferenceEngineInterface):
         """
         if in_memory == (lora_path is not None):
             raise ValueError("load_lora_adapter takes exactly one of lora_path or in_memory=True")
+
+        budget_s = self._resolve_lora_phase_budget(None)
+        deadline_at = None if (budget_s is None or budget_s <= 0) else (time.monotonic() + budget_s)
+        unresolved = await self.drain_pending_lora_loads(timeout_s=budget_s)
+        if unresolved:
+            raise InferenceServerTimeoutError(
+                "POST",
+                f"Cannot load LoRA adapter {lora_name!r} while prior load_lora_adapter request(s) are still "
+                f"in flight or unconfirmed: {', '.join(unresolved)}",
+                budget_s or 0.0,
+            )
+
         session = await self._get_session()
 
         async def _load_on_server(server_url: str):
@@ -1564,17 +2013,67 @@ class RemoteInferenceClient(InferenceEngineInterface):
                 if in_memory
                 else {"lora_name": lora_name, "lora_path": lora_path}
             )
-            async with _control_plane_request(session, "POST", url, json=payload) as resp:
+            # Connect-only timeout so the HTTP socket remains open until the server
+            # confirms completion; phase deadline is enforced below without cancelling
+            # accepted server-side loads.
+            async with _control_plane_request(session, "POST", url, connect_only=True, json=payload) as resp:
                 if resp.status >= 400:
                     body = await _read_json_body(resp)
                     raise_for_status(resp, body)
                 return server_url, {"status": resp.status, "body": await resp.text()}
 
-        results = await asyncio.gather(*[_load_on_server(url) for url in self.server_urls])
+        remaining_s = None if deadline_at is None else max(0.05, deadline_at - time.monotonic())
+        with control_plane_timeout_budget(remaining_s):
+            tasks: List[Tuple[str, asyncio.Task[Any]]] = [
+                (url, asyncio.create_task(_load_on_server(url))) for url in self.server_urls
+            ]
+        pending = {task for _, task in tasks}
+        cancelled = False
+        while pending:
+            rem = None if deadline_at is None else max(0.0, deadline_at - time.monotonic())
+            if rem is not None and rem <= 0.0:
+                break
+            try:
+                done, pending = await asyncio.wait(pending, timeout=rem)
+                if not done and deadline_at is not None and time.monotonic() >= deadline_at:
+                    break
+            except asyncio.CancelledError:
+                cancelled = True
+                break
+
+        responses: Dict[str, Any] = {}
+        errors: Dict[str, BaseException] = {}
+        for url, task in tasks:
+            if task.done() and not task.cancelled():
+                exc = task.exception()
+                if exc is not None:
+                    if _is_unconfirmed_async_transport_error(exc):
+                        self._record_unconfirmed_lora_load(url, lora_name, exc)
+                    errors[url] = exc
+                else:
+                    _, resp = task.result()
+                    responses[url] = resp
+            else:
+                # Keep the task alive and tracked so server completion is confirmed
+                # before a subsequent load, unload, arm, or disk overwrite proceeds.
+                if not task.done():
+                    self._inflight_lora_load_entries().append((url, lora_name, task))
+                errors[url] = (
+                    asyncio.CancelledError()
+                    if cancelled
+                    else InferenceServerTimeoutError("POST", f"{url}/skyrl/v1/load_lora_adapter", budget_s or 0.0)
+                )
+
+        if cancelled:
+            raise asyncio.CancelledError() from next(
+                (e for e in errors.values() if not isinstance(e, asyncio.CancelledError)), None
+            )
+        if errors:
+            raise next(iter(errors.values()))
 
         logger.info(f"Loaded LoRA adapter '{lora_name}' from {'staged GPU tensors' if in_memory else lora_path}")
 
-        return {url: resp for url, resp in results}
+        return responses
 
     async def unload_lora_adapter(self, lora_name: str) -> Dict[str, Any]:
         """
@@ -1590,6 +2089,14 @@ class RemoteInferenceClient(InferenceEngineInterface):
         Returns:
             Dict mapping server_url to response.
         """
+        unresolved = await self.drain_pending_lora_loads()
+        if unresolved:
+            raise InferenceServerTimeoutError(
+                "POST",
+                f"Cannot unload LoRA adapter {lora_name!r} while prior load_lora_adapter request(s) are still "
+                f"in flight or unconfirmed: {', '.join(unresolved)}",
+                self._resolve_lora_phase_budget(None) or 0.0,
+            )
         payload = {"lora_name": lora_name}
 
         # Mirror load_lora_adapter: vLLM returns plain text on success and JSON
@@ -1697,6 +2204,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
         state["_gen_sem"] = None
         state["_detok_sem"] = None
         state["_sem_loop"] = None
+        state["_inflight_lora_loads"] = []
         return state
 
     def __setstate__(self, state: dict) -> None:
@@ -1705,6 +2213,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
         self._gen_sem = None
         self._detok_sem = None
         self._sem_loop = None
+        self._inflight_lora_loads = []
 
     async def aclose(self) -> None:
         await self.teardown()

@@ -75,6 +75,10 @@ class DeltaTrainerWeightTransferEngine(SkyrlTrainerCapabilities, TrainerWeightTr
     # must not also fire a concurrent reset (see workers/worker.py).
     skyrl_handles_prefix_cache_reset = True
 
+    # Persists across calls whenever a reload starts without completing so a
+    # subsequent pre-reload failure cannot resume servers with incomplete weights.
+    _reload_incomplete: bool = False
+
     def __init__(
         self,
         *,
@@ -167,6 +171,13 @@ class DeltaTrainerWeightTransferEngine(SkyrlTrainerCapabilities, TrainerWeightTr
             self._apply_receiver_update(update_info)
 
     def _apply_receiver_update(self, update_info: dict) -> None:
+        import time
+
+        from skyrl.backends.skyrl_train.weight_sync.control_plane import (
+            current_weight_sync_deadline,
+            weight_sync_client_deadline,
+        )
+
         target_version = int(update_info.get("target_version", update_info.get("version")))
         # Before the pause, so the download overlaps live generation.
         self.client.fetch_weights(
@@ -174,22 +185,62 @@ class DeltaTrainerWeightTransferEngine(SkyrlTrainerCapabilities, TrainerWeightTr
             sync_dir=update_info.get("sync_dir", self._init_info.sync_dir),
             uri=update_info.get("uri"),
         )
-        self.client.pause_generation()
+
+        outer_deadline = current_weight_sync_deadline()
+        resume_reserve = 0.0
+        if outer_deadline is not None:
+            remaining = max(0.05, outer_deadline - time.monotonic())
+            resume_reserve = min(remaining * 0.25, 30.0)
+            update_deadline: Optional[float] = time.monotonic() + max(0.05, remaining - resume_reserve)
+        else:
+            update_deadline = None
+
+        primary_exc: Optional[BaseException] = None
         try:
-            if self._reset_prefix_cache:
-                self.client.reset_prefix_cache(reset_running_requests=True)
-            self.client.start_weight_update()
-            self.client.update_weights(update_info)
-            self.client.finish_weight_update()
-            if self.skyrl_draft_source is not None:
-                # The published checkpoint already carries the MTP head: the
-                # drafter reloads the same version, filtering to its own names.
-                with self.client.draft_session():
-                    self.client.start_weight_update()
-                    self.client.update_weights(update_info)
-                    self.client.finish_weight_update()
+            with weight_sync_client_deadline(update_deadline):
+                self.client.pause_generation()
+                if self._reset_prefix_cache:
+                    self.client.reset_prefix_cache(reset_running_requests=True)
+                self._reload_incomplete = True
+                self.client.start_weight_update()
+                self.client.update_weights(update_info)
+                self.client.finish_weight_update()
+                if self.skyrl_draft_source is not None:
+                    # The published checkpoint already carries the MTP head: the
+                    # drafter reloads the same version, filtering to its own names.
+                    with self.client.draft_session():
+                        self.client.start_weight_update()
+                        self.client.update_weights(update_info)
+                        self.client.finish_weight_update()
+                self._reload_incomplete = False
+        except BaseException as exc:
+            primary_exc = exc
+            raise
         finally:
-            self.client.resume_generation()
+            if self._reload_incomplete:
+                # Never resume generation while any reload has started without
+                # completing (including across retries after an earlier failed reload):
+                # model weights may be on the meta device or partially updated.
+                msg = (
+                    "Skipping delta sync resume_generation because weight reload did not complete; "
+                    "leaving inference servers paused to avoid serving incomplete weights."
+                )
+                logger.warning(msg)
+                if primary_exc is not None:
+                    primary_exc.add_note(msg)
+            else:
+                resume_deadline = outer_deadline
+                if resume_deadline is not None:
+                    resume_deadline = max(resume_deadline, time.monotonic() + min(0.5, resume_reserve))
+                try:
+                    with weight_sync_client_deadline(resume_deadline):
+                        self.client.resume_generation()
+                except Exception as resume_exc:
+                    if primary_exc is not None:
+                        logger.warning("Delta sync resume_generation failed during cleanup: %s", resume_exc)
+                        primary_exc.add_note(f"Cleanup resume_generation also failed: {resume_exc}")
+                    else:
+                        raise
 
     def shutdown(self) -> None:
         self._publisher = None
