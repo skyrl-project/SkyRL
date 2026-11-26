@@ -426,6 +426,14 @@ def test_extract_solution(solution_str, expected):
         ("Emmanuel Macron", ["Emmanuel Macron", "Macron"], 1),
         # No match in list
         ("Sarkozy", ["Emmanuel Macron", "Macron"], 0),
+        # Typographic punctuation: curly apostrophe and quotes, en dash, Unicode hyphen, either side
+        ("Schindler\u2019s List", "Schindler's List", 1),
+        ("Schindler's List", "Schindler\u2019s List", 1),
+        ("\u201cHamlet\u201d", "Hamlet", 1),
+        ("1914\u20131918", "1914-1918", 1),
+        ("Jean\u2010Paul Sartre", "Jean-Paul Sartre", 1),
+        # Accented letters are not punctuation
+        ("\u00e9t\u00e9", "ete", 0),
     ],
 )
 def test_em_check(prediction, golden_answers, expected):
