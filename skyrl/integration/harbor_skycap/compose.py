@@ -20,7 +20,10 @@ The masking policy is the sibling's, from ``harbor/masking.py``: an instance
 with a failed rollout is masked whole, and so is one where at least
 ``timeout_mask_instance_fraction`` of its rollouts timed out; below that, the
 timed-out rollouts mask only themselves. A trial that hit the context limit
-trains with its reward unless overlong filtering is on.
+trains with its reward unless overlong filtering is on. In eval
+(``mask_groups=False``) there is no group baseline to protect, so a trial that
+timed out or failed scores 0 on its own and the other trials of its instance
+keep their rewards.
 
 With ``include_images``, each row carries its path's ``pixel_values`` and ``image_grid_thw``, its images in
 placeholder order. A row without images (a masked rollout's placeholder) carries zero-row tensors, as the
@@ -131,6 +134,7 @@ def compose(
     outcomes: List[TrialOutcome],
     *,
     overlong_filtering: bool,
+    mask_groups: bool = True,
     timeout_mask_instance_fraction: float = TIMEOUT_MASK_INSTANCE_FRACTION,
     top_k: int = -1,
     sample_support: bool = False,
@@ -139,14 +143,25 @@ def compose(
 ) -> GeneratorOutput:
     """``top_k`` bounds sampler-support rows, as SkyRL's own capture does.
 
+    ``mask_groups`` applies ``harbor/masking.py``'s rule, so GRPO never computes a baseline from a group with
+    holes in it; eval turns it off and scores each failed trial 0 alone.
     ``timeout_mask_instance_fraction`` is ``generator.timeout_mask_instance_fraction``.
     ``sample_support`` says the engine returns sampler support, so a batch with nothing to train
     still carries (empty) support rows, as every other batch will. ``routed_experts`` says the same
     of routes (R3); every trained row must then have them. ``include_images`` adds each row's vision features.
     """
-    masked, masking_counts = mask_failed_trials(
-        [(o.trajectory_id.instance_id, o.stop_reason) for o in outcomes], timeout_mask_instance_fraction
-    )
+    trials = [(o.trajectory_id.instance_id, o.stop_reason) for o in outcomes]
+    if mask_groups:
+        masked, masking_counts = mask_failed_trials(trials, timeout_mask_instance_fraction)
+    else:
+        masked = [stop_reason in ("agent_timeout", "error") for _, stop_reason in trials]
+        masking_counts = {
+            "num_timeout_trajectories": sum(stop_reason == "agent_timeout" for _, stop_reason in trials),
+            "num_error_trajectories": sum(stop_reason == "error" for _, stop_reason in trials),
+            "num_masked_instances": 0,
+            "num_instance_with_timeouts_unmasked": 0,
+            "num_traj_masked_individually": sum(masked),
+        }
 
     groups: List[List[_Row]] = []
     trained: List[TrialOutcome] = []
@@ -191,7 +206,7 @@ def compose(
             out["response_ids"].append(row.response)
             out["rewards"].append(0.0 if is_masked else outcome.reward)
             out["loss_masks"].append(row.loss_mask)
-            out["stop_reasons"].append("error" if is_masked else outcome.stop_reason)
+            out["stop_reasons"].append("error" if is_masked and mask_groups else outcome.stop_reason)
             out["rollout_logprobs"].append(row.logprobs)
             out["trajectory_ids"].append(outcome.trajectory_id)
             out["is_last_step"].append(last)
