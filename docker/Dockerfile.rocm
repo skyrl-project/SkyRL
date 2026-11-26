@@ -1,0 +1,151 @@
+# SkyRL's Megatron backend on AMD Instinct GPUs (ROCm): MI300X/MI325X and MI350X/MI355X.
+#
+# The parent image supplies the ROCm builds of torch, Triton and flash-attn, and vLLM at the version
+# SkyRL pins. This file adds AMD's fork of TransformerEngine and the two compiled packages of
+# megatron-core's Mamba layers, built from source, and every other package of SkyRL's lock at its pinned
+# version, minus the CUDA-only ones (docker/rocm-excluded-packages.txt).
+# megatron-core and Megatron-Bridge are the same commits as on NVIDIA.
+#
+# Build from the repository root, on x86-64 Linux; no GPU is needed to build:
+#   docker build -f docker/Dockerfile.rocm -t skyrl-rocm .
+#
+# Run SkyRL in the image with the image's own interpreter (`python -m skyrl.train.entrypoints.main_base
+# ...`). `uv run --isolated`, which the example scripts use, would resolve a fresh CUDA environment from
+# the lock.
+#
+# docker/Dockerfile.amd is a separate image: the Tinker API server with the FSDP backend.
+FROM vllm/vllm-openai-rocm:v0.33.0-rocm100
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG UV_VERSION=0.11.11
+# AMD's TransformerEngine fork, at the tag that matches the transformer-engine version in uv.lock.
+ARG TE_TAG=v2.19_rocm
+# The GPU architectures TransformerEngine and the Mamba packages are compiled for: gfx942 is MI300X/MI325X,
+# gfx950 is MI350X/MI355X.
+ARG NVTE_ROCM_ARCH="gfx942;gfx950"
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ENV PATH=/root/.local/bin:${PATH}
+
+# Ray writes no per-process GPU mask in this image: every process sees every GPU, and SkyRL selects its
+# own by the index Ray assigned. Under Ray's default masking a trainer process sees one GPU while the
+# workers of a multi-GPU inference engine see several, and RCCL then cannot connect the group that
+# carries the weights from one to the other (_validate_megatron_cfg_on_rocm in skyrl/train/utils/utils.py).
+ENV RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES=1 \
+    RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
+
+# flash-linear-attention has a TileLang variant of one Gated DeltaNet backward kernel, which SkyRL turns
+# on by default and which needs NVIDIA's compiler. Keep Gated DeltaNet on the Triton kernels.
+ENV FLA_TILELANG=0
+
+# hipBLASLt in the ROCm 10.0.0 SDK of the parent image fails a bf16 matrix multiply at some row counts
+# (https://github.com/ROCm/rocm-libraries/issues/16517). TransformerEngine then raises
+# `HIPBLASLT Error: 6` and the trainer dies, for example Qwen3-4B with micro-batches of 4 sequences;
+# PyTorch warns and recomputes with rocBLAS. Turning off Stream-K's dynamic grid is AMD's workaround in
+# that issue: on MI355X no row count fails with it at the layer sizes of Qwen3-4B and Qwen3.5-4B, and a
+# training step takes about 5% longer.
+# ROCm 10.1 fixes hipBLASLt: remove this variable once the parent image is on ROCm 10.1.
+ENV TENSILE_STREAMK_DYNAMIC_GRID=0
+
+# Without this, a weight sync over NCCL from a Megatron trainer whose experts span 8 GPUs gives the
+# inference engines wrong expert weights, with no error (RCCL 2.30.4, Qwen3.5-35B-A3B at TP2 and EP8).
+# vLLM's packed sender gathers the next chunk from the trainer's ranks on a second GPU stream while the
+# chunk before is still being broadcast, and the gathered tensors are then read before the other ranks'
+# rows have arrived. The variable makes RCCL launch the operations of all communicators on a device in
+# the order the host issued them. NCCL on NVIDIA delivers the right weights without it.
+# Cost: a training step of that model takes about 6% longer, in the trainer's forward pass and update.
+# TODO: send through one packed buffer instead (vLLM's `packed_num_buffers=1`, which SkyRL's NCCL sender
+# in skyrl/backends/skyrl_train/weight_sync/weight_senders.py does not pass today). That is also right,
+# costs no step time, and needs no variable; remove this one then.
+ENV NCCL_LAUNCH_ORDER_IMPLICIT=1
+
+RUN apt-get update -y && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        curl \
+        git \
+        iproute2 \
+        iputils-ping \
+        kmod \
+        libnuma-dev \
+        libxml2 \
+        net-tools \
+        netcat-openbsd \
+        openssh-server \
+        traceroute \
+        tzdata \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN if ! command -v uv >/dev/null 2>&1; then \
+        curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh; \
+    fi \
+    && uv --version
+
+# ---------- TransformerEngine (AMD's fork), built against the parent image's torch ----------
+# It has no prebuilt wheel at this version. The ROCm compilers and libraries come from the parent image,
+# which carries the ROCm SDK's devel tree and exports ROCM_PATH, HIP_PATH and HIP_CLANG_PATH for it.
+RUN python -m pip install --no-cache-dir packaging "cmake<4" ninja wheel "setuptools<80" pybind11==3.0.4 Cython \
+    && git clone --recursive --branch "${TE_TAG}" --depth 1 --shallow-submodules \
+        https://github.com/ROCm/TransformerEngine.git /tmp/TransformerEngine \
+    && cd /tmp/TransformerEngine \
+    && HIP_PLATFORM=amd CMAKE_PREFIX_PATH="${ROCM_PATH}/lib/cmake/" \
+        NVTE_FRAMEWORK=pytorch NVTE_USE_ROCM=1 NVTE_ROCM_ARCH="${NVTE_ROCM_ARCH}" \
+        MAX_JOBS="$(nproc)" CMAKE_BUILD_PARALLEL_LEVEL="$(nproc)" \
+        python -m pip install --no-cache-dir --no-build-isolation --no-deps . \
+    && cd / \
+    && rm -rf /tmp/TransformerEngine
+
+# ---------- causal-conv1d and mamba-ssm, built for ROCm ----------
+# megatron-core's Mamba layers (NemotronH models) cannot be built without mamba-ssm, and their training
+# path calls causal-conv1d's compiled functions. The lock has both as CUDA wheels; each project's setup.py
+# has a HIP build, which compiles with the parent image's hipcc. About 28 minutes, nearly all of it
+# mamba-ssm's selective-scan kernels.
+# --no-deps: mamba-ssm's metadata asks for tilelang, apache-tvm-ffi and quack-kernels, which are CUDA-only
+#   and which megatron-core's Mamba path does not use, and for a triton that must not replace the parent's.
+# The sed: on a ROCm torch, mamba-ssm asks GPU 0 for its architecture when it is imported, so a process
+#   without a GPU (this build, a CPU-only head node) cannot import megatron-core's Mamba mixer. Without a
+#   GPU it now takes the Instinct answer; with one, nothing changes.
+# The tags match the two versions in uv.lock. They are declared here, after the TransformerEngine layer,
+# so that changing one does not rebuild it.
+ARG CAUSAL_CONV1D_TAG=v1.7.0
+ARG MAMBA_TAG=v2.3.2.post1
+RUN git clone --depth 1 --branch "${CAUSAL_CONV1D_TAG}" https://github.com/Dao-AILab/causal-conv1d /tmp/causal-conv1d \
+    && git clone --depth 1 --branch "${MAMBA_TAG}" https://github.com/state-spaces/mamba /tmp/mamba \
+    && sed -i 's/gcn_arch_name = torch.cuda.get_device_properties(0).gcnArchName$/& if torch.cuda.is_available() else "gfx950"/' \
+        /tmp/mamba/mamba_ssm/ops/triton/layer_norm.py \
+    && grep -q 'gcnArchName if torch.cuda.is_available() else "gfx950"' /tmp/mamba/mamba_ssm/ops/triton/layer_norm.py \
+    && export HIP_ARCHITECTURES="${NVTE_ROCM_ARCH//;/,}" CAUSAL_CONV1D_FORCE_BUILD=TRUE MAMBA_FORCE_BUILD=TRUE \
+    && python -m pip install --no-cache-dir --no-build-isolation --no-deps /tmp/causal-conv1d \
+    && python -m pip install --no-cache-dir --no-build-isolation --no-deps /tmp/mamba \
+    && rm -rf /tmp/causal-conv1d /tmp/mamba
+
+WORKDIR /workspace/SkyRL
+COPY . /workspace/SkyRL
+
+# ---------- SkyRL and its lock, minus the CUDA-only packages ----------
+# --no-deps: the list is the whole lock already, and resolving dependencies would let megatron-bridge's
+#   metadata pull the CUDA TransformerEngine back in.
+# --no-config: without it uv applies the override-dependencies of pyproject.toml, which replace the
+#   megatron-core git pin in the list with the newest PyPI release.
+# The verify command fails the build if a package of the parent image was replaced, a CUDA-tagged
+# distribution was installed, or a git pin is not installed from its pinned commit. The command after it
+# imports the Megatron worker, which needs no GPU, and fails the build if SkyRL's extra Megatron bridges
+# did not register: without them a Qwen3.5 model is built through the wrong bridge. The last one fails the
+# build if megatron-core does not find the Mamba packages.
+RUN python docker/rocm_requirements.py snapshot > /tmp/rocm-protected.json \
+    && uv export --frozen --no-hashes --no-annotate --no-emit-project --extra megatron --extra dev \
+        -q -o .rocm-export.txt \
+    && python docker/rocm_requirements.py filter .rocm-export.txt docker/rocm-excluded-packages.txt \
+        > .rocm-requirements.txt \
+    && STRAGGLER_DET_SKIP_CUPTI_EXT_BUILD=1 \
+        uv pip install --system --no-config --no-deps --no-cache-dir -r .rocm-requirements.txt \
+    && uv pip install --system --no-config --no-deps --no-cache-dir -e . \
+    && python docker/rocm_requirements.py verify /tmp/rocm-protected.json .rocm-requirements.txt \
+    && python -c "import torch; assert torch.version.hip is not None; print('torch', torch.__version__, 'hip', torch.version.hip)" \
+    && python -c "import skyrl.train.entrypoints.main_base; from skyrl.backends.skyrl_train.workers.megatron import megatron_worker, model_bridges as b; assert hasattr(b, 'Qwen35DenseLMBridge') and hasattr(b, 'Qwen35MoELMBridge'), 'extra Megatron bridges are not registered'; print('megatron worker imports; extra Megatron bridges registered')" \
+    && python -c "import torch, causal_conv1d_cuda, selective_scan_cuda; from megatron.core.ssm import mamba_mixer; assert mamba_mixer.HAVE_MAMBA_SSM, 'megatron-core does not find mamba_ssm'; print('megatron-core finds mamba_ssm')"
+
+ENTRYPOINT []
+CMD ["/bin/bash"]
