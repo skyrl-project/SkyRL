@@ -171,11 +171,13 @@ async def generator(skycap):
     """Makes generators against the test's skycap, and closes each one's pool when the test ends."""
     made = []
 
-    def make(train_paths: str = "all", check_first_batch: bool = True, **cfg) -> HarborSkycapGenerator:
+    def make(
+        train_paths: str = "all", check_first_batch: bool = True, harbor: dict | None = None, **cfg
+    ) -> HarborSkycapGenerator:
         made.append(
             HarborSkycapGenerator(
                 generator_cfg(**cfg),
-                harbor_cfg(),
+                harbor_cfg() if harbor is None else harbor,
                 [skycap.url],
                 SimpleNamespace(weight_version=7),
                 train_paths=train_paths,
@@ -511,28 +513,57 @@ async def test_a_trial_with_no_captured_tokens_is_retried_then_masked_not_reward
     assert metrics["generate/harbor/environment_setup_time_mean"] == pytest.approx(SETUP)
 
 
+# Each prompt names the fake trial's script (fakes.py, FakeTrial.run): "linear" trains, "silent" never calls the
+# model, and "timeout" calls it and then times out, so compose masks it.
+TRAINS, NO_TOKENS, MASKED = "linear", "silent", "timeout"
+
+
+async def generate_in_order(gen: HarborSkycapGenerator, batches: list[tuple[str, list[str]]]) -> None:
+    """Runs each ``(training_phase, prompts)`` batch through ``gen.generate``, in order."""
+    for phase, prompts in batches:
+        metadata = SimpleNamespace(global_step=3, training_phase=phase)
+        await gen.generate({**batch(*prompts), "batch_metadata": metadata}, disable_tqdm=True)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "batches, check, stops",
+    "batches",
     [
-        ([("silent",)], True, True),
-        ([("silent",)], False, False),
-        ([("silent", "linear")], True, False),
-        ([("linear",), ("silent",)], True, False),
+        pytest.param([("train", [NO_TOKENS])], id="no tokens captured"),
+        pytest.param([("train", [MASKED])], id="captured but masked"),
+        pytest.param([("eval", [TRAINS]), ("train", [NO_TOKENS])], id="after an eval"),
     ],
-    ids=["nothing trains", "check off", "one trajectory trains", "a later batch"],
 )
-async def test_a_first_batch_with_nothing_to_train_stops_the_run(skycap, trials, generator, batches, check, stops):
-    gen = generator(check_first_batch=check)
-    *earlier, last = batches
-    for scripts in earlier:
-        await gen.generate(batch(*scripts), disable_tqdm=True)
-    if stops:
-        with pytest.raises(RuntimeError, match=r"first batch \(1\).*~/trials.*skycap\.check_first_batch=false"):
-            await gen.generate(batch(*last), disable_tqdm=True)
-    else:
-        out = await gen.generate(batch(*last), disable_tqdm=True)
-        assert len(out["trajectory_ids"]) == len(last)
+async def test_the_first_training_batch_with_nothing_to_train_stops_the_run(skycap, trials, generator, batches):
+    with pytest.raises(RuntimeError, match=r"first training batch \(1\).*~/trials.*skycap\.check_first_batch=false"):
+        await generate_in_order(generator(), batches)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "batches, check_first_batch",
+    [
+        pytest.param([("train", [NO_TOKENS])], False, id="check off"),
+        pytest.param([("train", [NO_TOKENS, TRAINS])], True, id="one trajectory trains"),
+        pytest.param([("train", [TRAINS]), ("train", [NO_TOKENS])], True, id="only the first batch is checked"),
+        pytest.param([("eval", [NO_TOKENS])], True, id="eval batches are not checked"),
+    ],
+)
+async def test_the_run_goes_on_when_the_first_training_batch_trains_or_the_check_is_off(
+    skycap, trials, generator, batches, check_first_batch
+):
+    await generate_in_order(generator(check_first_batch=check_first_batch), batches)
+
+
+@pytest.mark.asyncio
+async def test_with_no_trials_dir_in_the_template_the_first_batch_error_names_harbors_default(
+    skycap, trials, generator
+) -> None:
+    template = harbor_cfg()
+    del template["trials_dir"]
+    # "trials" is the default of Harbor's TrialConfig.trials_dir.
+    with pytest.raises(RuntimeError, match=r"logs are under trials\. "):
+        await generate_in_order(generator(harbor=template), [("train", [NO_TOKENS])])
 
 
 def test_a_batch_with_nothing_to_train_still_carries_padded_support() -> None:
