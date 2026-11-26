@@ -81,13 +81,15 @@ LR=1e-5 # 10x compared to full finetuning
 TIS_RATIO_TYPE="token"
 TIS_IMP_RATIO_CAP=2.0
 
-uv run --isolated --extra megatron -m skyrl.train.entrypoints.main_base \
+uv run --isolated --extra megatron -m examples.train.algorithms.dapo.main_dapo \
   data.train_data="['$TRAIN_FILE']" \
   data.val_data="['$TEST_FILE']" \
   trainer.algorithm.advantage_estimator="grpo" \
   trainer.algorithm.policy_loss_type="dual_clip" \
   trainer.algorithm.overlong_buffer_len=$OVERLONG_BUFFER_LEN \
   trainer.algorithm.overlong_buffer_penalty_factor=$OVERLONG_BUFFER_PENALTY_FACTOR \
+  trainer.algorithm.eps_clip_low=$CLIP_RATIO_LOW \
+  trainer.algorithm.eps_clip_high=$CLIP_RATIO_HIGH \
   trainer.algorithm.loss_reduction=$LOSS_REDUCTION \
   trainer.algorithm.grpo_norm_by_std=true \
   generator.inference_engine.enforce_eager=$ENFORCE_EAGER \
