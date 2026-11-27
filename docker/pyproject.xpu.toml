@@ -78,7 +78,7 @@ skyrl-train = [
 
 fsdp = [
     "skyrl[skyrl-train]",
-    "vllm==0.32.0",
+    "vllm==0.33.0",
     "triton==3.9.0+xpu",
     "torchaudio==2.11.1",
     "torchcodec==0.17.0",
@@ -148,7 +148,7 @@ torchaudio = { index = "pytorch-xpu" }
 torchcodec = { index = "pytorch-xpu" }
 triton-xpu = { index = "pytorch-xpu" }
 triton = { index = "vllm-xpu" }
-vllm = { url = "https://github.com/vllm-project/vllm/releases/download/v0.32.0/vllm-0.32.0+xpu-cp38-abi3-manylinux_2_34_x86_64.whl" }
+vllm = { url = "https://github.com/vllm-project/vllm/releases/download/v0.33.0rc3/vllm-0.33.0+xpu-cp38-abi3-manylinux_2_34_x86_64.whl" }
 vllm-router = { url = "https://github.com/SumanthRH/router/releases/download/0.1.14.post1/vllm_router-0.1.14.post1-cp38-abi3-manylinux_2_35_x86_64.whl" }
 
 [tool.pytest.ini_options]
