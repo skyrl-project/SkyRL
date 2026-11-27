@@ -19,6 +19,7 @@ _VLLM_WORKER_CLS = {
     "xpu": "vllm.v1.worker.xpu_worker.XPUWorker",
 }
 
+
 def device_type() -> str:
     """Return the device type training runs on. Eg: ``"cuda"`` or ``"xpu"``.
     Uses the accelerator torch was built for, so it works in a process that sees no device.
@@ -36,10 +37,12 @@ def device_module():
 
     return torch.get_device_module(device_type())
 
+
 def vllm_device_control_env_var() -> str:
     """Return the env var vLLM uses to pick devices for ``device_type()``. Eg: ``"CUDA_VISIBLE_DEVICES"``."""
 
     return _VLLM_DEVICE_CONTROL_ENV_VAR[device_type()]
+
 
 def vllm_worker_cls() -> str:
     """Return vLLM's default worker class for ``device_type()``. Eg: ``"vllm.v1.worker.gpu_worker.Worker"``."""

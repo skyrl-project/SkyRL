@@ -135,6 +135,7 @@ def test_serialized_fp8_rejects_unsupported_model_layout(monkeypatch):
 def test_build_vllm_cli_args_succeeds_on_gpu_less_host(monkeypatch, dev_type):
     import vllm.platforms
     from vllm.platforms.interface import UnspecifiedPlatform
+
     import skyrl.backends.skyrl_train.inference_servers.utils as inference_utils
 
     # Simulate the GPU-less Ray head-node case: vLLM resolves current_platform
