@@ -34,11 +34,12 @@ _WRAPPED_FLAG = "_skyrl_aot_save_wrapped"
 def _device_tag() -> str | None:
     """Tag for the device this worker compiles on, or None when there is no GPU."""
     try:
-        import torch
+        from skyrl.backends.skyrl_train.utils.device import device_module
 
-        if not torch.cuda.is_available():
+        device = device_module()
+        if not device.is_available():
             return None
-        return f"dev{torch.cuda.current_device()}"
+        return f"dev{device.current_device()}"
     except Exception as e:
         # A missing tag costs only the isolation, so it must not break startup.
         logger.debug(f"compile-cache device path: could not resolve device ({e})")

@@ -48,6 +48,11 @@ from skyrl.backends.skyrl_train.inference_servers.generate_wire import (
     pack_sample_support_logprobs,
 )
 from skyrl.backends.skyrl_train.inference_servers.protocols import ServerActorProtocol
+from skyrl.backends.skyrl_train.utils.device import (
+    device_type,
+    vllm_device_control_env_var,
+    vllm_worker_cls,
+)
 from skyrl.backends.skyrl_train.utils.sample_support import (
     SAMPLE_SUPPORT_DTYPE,
     CompactSampleSupport,
@@ -177,7 +182,7 @@ class VLLMServerActor(ServerActorProtocol):
         # _gpu_ids is passed by ServerGroup from the cached ResolvedPlacementGroup.bundle_gpu_ids.
         gpu_ids = kwargs.pop("_gpu_ids", None)
         if kwargs.get("distributed_executor_backend") == "mp" and gpu_ids is not None:
-            kwargs["mp_cuda_visible_devices"] = ",".join(str(g) for g in gpu_ids)
+            kwargs["mp_visible_devices"] = ",".join(str(g) for g in gpu_ids)
         return kwargs
 
     def __init__(
@@ -195,7 +200,7 @@ class VLLMServerActor(ServerActorProtocol):
         mooncake_bootstrap_base_port: int = 50052,
         colocated_training: bool = False,
         distributed_executor_backend: str = "ray",
-        mp_cuda_visible_devices: Optional[str] = None,
+        mp_visible_devices: Optional[str] = None,
         enable_ray_prometheus_stats: bool = True,
         metrics_role: Optional[str] = None,
     ):
@@ -219,9 +224,9 @@ class VLLMServerActor(ServerActorProtocol):
             colocated_training: Whether the server is colocated with training workers
             distributed_executor_backend: vLLM distributed executor backend.
                 ``"ray"`` spawns TP/PP workers as Ray tasks (default).
-                ``"mp"`` spawns workers as local processes using
-                CUDA_VISIBLE_DEVICES.
-            mp_cuda_visible_devices: Comma-separated physical GPU IDs for the
+                ``"mp"`` spawns workers as local processes using the
+                platform's device control env var (eg: CUDA_VISIBLE_DEVICES).
+            mp_visible_devices: Comma-separated physical GPU IDs for the
                 ``"mp"`` backend. Pre-computed by ServerGroup from the
                 per-server placement group. Only used when
                 ``distributed_executor_backend="mp"`` and TP*PP > 1.
@@ -322,7 +327,7 @@ class VLLMServerActor(ServerActorProtocol):
 
         # Configure GPU visibility for this server's TP/PP workers
         if self._use_mp_backend:
-            self._setup_mp_gpu_visibility(mp_cuda_visible_devices)
+            self._setup_mp_device_visibility(mp_visible_devices)
         else:
             os.environ["VLLM_RAY_PER_WORKER_GPUS"] = str(0.2 if colocated_training else 1.0)
             # Set bundle indices for this server's TP/PP workers in the placement group.
@@ -338,25 +343,22 @@ class VLLMServerActor(ServerActorProtocol):
         # Initialized lazily to not block the actor initialization.
         self._server_task: Optional[asyncio.Task] = None
 
-    def _setup_mp_gpu_visibility(self, mp_cuda_visible_devices: Optional[str]) -> None:
-        """Set CUDA_VISIBLE_DEVICES for the mp backend.
+    def _setup_mp_device_visibility(self, mp_visible_devices: Optional[str]) -> None:
+        """Set the device control env var (eg: CUDA_VISIBLE_DEVICES) for the mp backend.
 
         When using the mp backend, vLLM spawns workers as local processes.
-        They discover GPUs via CUDA_VISIBLE_DEVICES rather than inheriting
-        from a placement group.
+        They discover GPUs via the device control env var rather than
+        inheriting from a placement group.
         """
-        if mp_cuda_visible_devices is not None:
-            os.environ["CUDA_VISIBLE_DEVICES"] = mp_cuda_visible_devices
-            os.environ.pop("ROCR_VISIBLE_DEVICES", None)
-            os.environ.pop("HIP_VISIBLE_DEVICES", None)
-            logger.info(f"Server {self._server_idx}: mp backend, " f"CUDA_VISIBLE_DEVICES={mp_cuda_visible_devices}")
+        env_var = vllm_device_control_env_var()
+        os.environ.pop("ROCR_VISIBLE_DEVICES", None)
+        os.environ.pop("HIP_VISIBLE_DEVICES", None)
+        if mp_visible_devices is not None:
+            os.environ[env_var] = mp_visible_devices
+            logger.info(f"Server {self._server_idx}: mp backend, " f"{env_var}={mp_visible_devices}")
         else:
-            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-            os.environ.pop("ROCR_VISIBLE_DEVICES", None)
-            os.environ.pop("HIP_VISIBLE_DEVICES", None)
-            logger.info(
-                f"Server {self._server_idx}: mp backend, " f"cleared CUDA_VISIBLE_DEVICES (single-GPU or auto-detect)"
-            )
+            os.environ.pop(env_var, None)
+            logger.info(f"Server {self._server_idx}: mp backend, " f"cleared {env_var} (single-GPU or auto-detect)")
 
     def _setup_nixl_side_channel(self, side_channel_port: int) -> None:
         """
@@ -724,9 +726,9 @@ async def _build_and_serve_vllm_server(
 
     # Initialize the engine (this loads the model - takes time)
     engine_args = AsyncEngineArgs.from_cli_args(cli_args)
-    # Standalone parsing can leave the CUDA worker class unresolved.
+    # Standalone parsing can leave the GPU worker class unresolved.
     if engine_args.worker_cls == "auto":
-        engine_args.worker_cls = "vllm.v1.worker.gpu_worker.Worker"
+        engine_args.worker_cls = vllm_worker_cls()
 
     stat_loggers = None
     if enable_ray_prometheus_stats:
@@ -791,7 +793,7 @@ def _build_standalone_cli_args(argv: Optional[List[str]] = None) -> Namespace:
     # See build_vllm_cli_args: pin the device type so arg parsing's DeviceConfig
     # autodetection succeeds even before CUDA is fully initialized.
     if not current_platform.device_type:
-        current_platform.device_type = "cuda"
+        current_platform.device_type = device_type()
 
     parser = FlexibleArgumentParser(
         description="SkyRL standalone vLLM OpenAI-compatible server (with SkyRL weight-sync endpoints)."
@@ -811,8 +813,9 @@ def main(argv: Optional[List[str]] = None) -> None:
     endpoints (plus vLLM's native dev/weight-transfer endpoints), without Ray.
 
     Used for external rollout-server deployments (e.g. the Thunder agent), where
-    servers are launched directly with ``python -m`` and pinned to GPUs via
-    ``CUDA_VISIBLE_DEVICES`` rather than a Ray placement group. Ray-actor-only
+    servers are launched directly with ``python -m`` and pinned to GPUs via the
+    platform's device control env var (``CUDA_VISIBLE_DEVICES`` / ``ZE_AFFINITY_MASK``)
+    rather than a Ray placement group. Ray-actor-only
     concerns (placement-group bundle indices, DP master rendezvous) do not apply
     here; pass standard vLLM flags to control parallelism and placement.
     """

@@ -57,7 +57,11 @@ def _patch_packed_modules_mapping() -> list[str]:
 
     ``language_model_only`` selects the ``ForCausalLM`` variant, so set both when present.
     """
-    import vllm.models.glm5next as glm5next
+    try:
+        import vllm.models.glm5next as glm5next
+    except NotImplementedError as e:
+        # vLLM's glm5next module raises NotImplementedError on import on XPU.
+        raise ImportError(e) from e
 
     patched = []
     for cls_name in ("Glm5NextForConditionalGeneration", "Glm5NextForCausalLM"):

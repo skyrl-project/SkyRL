@@ -50,6 +50,7 @@ from skyrl.backends.skyrl_train.inference_servers.vllm_compat import (
     restore_model_state_tensors,
     save_model_state_tensors,
 )
+from skyrl.backends.skyrl_train.utils.device import device_module
 from skyrl.backends.skyrl_train.weight_sync.fp8 import (
     SKYRL_BATCHED_MOE_FP8_PREFIX,
     batched_moe_wire_targets,
@@ -443,9 +444,9 @@ class NewInferenceWorkerWrap:
         """
         from vllm.device_allocator import get_mem_allocator_instance
 
-        # Return the broadcast's reserved-but-unallocated blocks to CUDA so cumem can
-        # remap the KV pool at its fixed virtual addresses.
-        torch.cuda.empty_cache()
+        # Return the broadcast's reserved-but-unallocated blocks to the device so the
+        # sleep allocator (cumem/xpumem) can remap the KV pool at its fixed virtual addresses.
+        device_module().empty_cache()
 
         get_mem_allocator_instance().wake_up(tags)
         # Restore buffers (not covered by the broadcast) once weights remap.

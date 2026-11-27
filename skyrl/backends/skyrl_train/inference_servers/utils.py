@@ -19,6 +19,7 @@ from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import
 from skyrl.backends.skyrl_train.patches.vllm.patch_moe_expert_lora_rank import (
     ADDITIONAL_CONFIG_KEY as MOE_EXPERT_LORA_RANK_KEY,
 )
+from skyrl.backends.skyrl_train.utils.device import device_type
 
 # The receive-side engines must be registered in vLLM's factory before the
 # WeightTransferConfig below is built: `backend` is validated against the
@@ -255,12 +256,12 @@ def _base_vllm_cli_args(model_path: str, ie_cfg: InferenceEngineConfig, seed: in
     # ``device_type == ""``. vLLM's ``add_cli_args`` walks ``VllmConfig`` defaults
     # and instantiates ``DeviceConfig()`` (device="auto"), which in turn runs
     # ``DeviceConfig.__post_init__`` and raises ``Failed to infer device type``.
-    # Explicitly pin the platform's device type to ``cuda`` so the autodetection
-    # path in ``DeviceConfig.__post_init__`` succeeds during arg parsing.
+    # Explicitly pin the platform's device type to the one torch was built for
+    # so the autodetection path in ``DeviceConfig.__post_init__`` succeeds during arg parsing.
     # NOTE: mutating current_platform.device_type relies on vLLM 0.20.2's singleton
     # initialization where instance attrs shadow class attrs. This should be re-verified on vLLM bumps.
     if not current_platform.device_type:
-        current_platform.device_type = "cuda"
+        current_platform.device_type = device_type()
 
     # Create common CLI args namespace
     parser = FlexibleArgumentParser()

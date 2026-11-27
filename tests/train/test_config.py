@@ -239,6 +239,20 @@ def test_runtime_env_forwards_te_block_scale_mode(monkeypatch):
     assert env_vars["NVTE_FP8_BLOCK_SCALING_FP32_SCALES"] == "1"
 
 
+@pytest.mark.parametrize("dev_type, expected", [("xpu", "0"), ("cuda", None)])
+def test_runtime_env_disables_ray_override_on_zero_on_xpu(monkeypatch, dev_type, expected):
+    # With RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=1 on XPU, Ray sets ONEAPI_DEVICE_SELECTOR="level_zero:" on
+    # processes with no GPU, which crashes SYCL. So XPU forces the override off ("0"); CUDA leaves it unset.
+    monkeypatch.setattr(train_utils, "device_type", lambda: dev_type)
+    monkeypatch.setattr(train_utils, "peer_access_supported", lambda **_kwargs: True)
+    cfg = example_dummy_config()
+    cfg.trainer.strategy = "fsdp"
+
+    env_vars = prepare_runtime_environment(cfg)
+
+    assert env_vars.get("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO") == expected
+
+
 def test_runtime_env_supports_fsdp_without_megatron_configs(monkeypatch):
     monkeypatch.delenv("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", raising=False)
     monkeypatch.delenv("NVTE_FP8_BLOCK_AMAX_EPSILON", raising=False)
