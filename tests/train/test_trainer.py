@@ -10,7 +10,11 @@ import torch
 from jaxtyping import Float, Integer
 from pytest import approx
 
-from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
+from skyrl.backends.skyrl_train.training_batch import (
+    TrainingInputBatch,
+    pad_training_input_batch,
+)
+from skyrl.backends.skyrl_train.utils.ppo_utils import AdaptiveKLController
 from skyrl.backends.skyrl_train.workers.worker import CriticWorkerBase, PolicyWorkerBase
 from skyrl.backends.skyrl_train.workers.worker_utils import BatchIterator
 from skyrl.train.config import SkyRLTrainConfig
@@ -63,7 +67,7 @@ def dummy_generator():
     return MagicMock()
 
 
-def _get_test_data(trainer: RayPPOTrainer):
+def _get_test_data(trainer: RayPPOTrainer, pad_size: int = 0):
     trainer.critic_model = MagicMock()  # pretend we're using a critic
 
     batch_size = 2
@@ -90,7 +94,6 @@ def _get_test_data(trainer: RayPPOTrainer):
         [torch.tensor([0.0, 1.0, 0.0, 0.0, 0.0]), torch.tensor([0.0, 0.0, 1.0, 0.0, 0.0])], dim=0
     )
     values: Float[torch.Tensor, "batch_size action_len"] = torch.randn(batch_size, action_len)
-    uids: np.ndarray[str] = np.array(["0", "0"])
 
     # Run method
     data = TrainingInputBatch(
@@ -106,10 +109,12 @@ def _get_test_data(trainer: RayPPOTrainer):
         },
     )
     data.metadata = {
-        "uids": uids,
+        "uids": ["0", "0"],
         "response_length": action_len,
         "avg_response_length": actual_response_lengths.mean().item(),
     }
+    if pad_size:
+        data = pad_training_input_batch(data, pad_size)
     data = trainer.apply_reward_kl_penalty(data)
 
     return data
@@ -146,7 +151,8 @@ def test_convert_to_training_input_records_sample_support_metrics(dummy_config, 
     assert trainer.all_metrics["generate/sample_support_full_fraction"] == 0.25
 
 
-def test_calculate_kl_create_experience_batched(dummy_config):
+@pytest.mark.parametrize("pad_size", [0, 6])
+def test_calculate_kl_create_experience_batched(dummy_config, pad_size):
     trainer = RayPPOTrainer(
         cfg=dummy_config,
         tracker=None,
@@ -156,12 +162,14 @@ def test_calculate_kl_create_experience_batched(dummy_config):
         inference_engine_client=None,
         generator=dummy_generator,
     )
-    data = _get_test_data(trainer)
+    trainer.reward_kl_controller = AdaptiveKLController(init_kl_coef=1.0, target=0.1, horizon=10)
+    data = _get_test_data(trainer, pad_size)
     # Assertions
     metrics = data.metadata["metrics"]
     assert metrics["avg_kl_max"] == approx(0.3143, abs=1e-4)
     # Note; the raw KL mean is 0.054, but then the masked mean is different.
     assert metrics["avg_kl"] == approx(0.1249, abs=1e-4)
+    assert trainer.reward_kl_controller.value == approx(1.04)
 
 
 @patch("skyrl.backends.skyrl_train.utils.ppo_utils.compute_advantages_and_returns", new_callable=MagicMock)
