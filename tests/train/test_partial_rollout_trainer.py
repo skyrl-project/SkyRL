@@ -188,7 +188,8 @@ def test_partial_rollout_step_sleeps_trains_checkpoints_then_syncs(monkeypatch):
 
     asyncio.run(trainer.train())
 
-    # The order is: the initial sync, two steps, the sleep at the end of training, and the final checkpoint.
+    # The order is: the initial sync, two steps, and the sleep at the end of training. The last step already
+    # saved its checkpoint, so no final checkpoint follows.
     assert order == [
         "sync",
         "sleep",
@@ -200,7 +201,6 @@ def test_partial_rollout_step_sleeps_trains_checkpoints_then_syncs(monkeypatch):
         "ckpt",
         "sync",
         "final_sleep",
-        "ckpt",
     ], order
     event_names = [name for name, _ in recorder.events]
     assert event_names.count("on_step_start") == 2
