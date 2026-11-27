@@ -35,6 +35,7 @@ from skyrl.backends.skyrl_train.kernels.nvfp4_quant import (
     BLOCK_SCALE_FOUR_OVER_SIX,
     flashinfer_nvfp4_env,
 )
+from skyrl.backends.skyrl_train.utils.device import device_module
 from skyrl.backends.skyrl_train.utils.io.io import is_cloud_path
 from skyrl.backends.skyrl_train.weight_sync.fp8 import (
     AUTO_FP8,
@@ -1720,7 +1721,7 @@ def print_mem(tag: str, mem: dict):
 
 
 def run_p2p_access_check():
-    device_count = torch.cuda.device_count()
+    device_count = device_module().device_count()
     if device_count < 2:
         return False
 
@@ -1729,7 +1730,7 @@ def run_p2p_access_check():
         for j in range(device_count):
             if i != j:
                 # This checks if device i can access device j's memory
-                can_access = torch.cuda.can_device_access_peer(i, j)
+                can_access = device_module().can_device_access_peer(i, j)
                 if not can_access:
                     return False
 
@@ -1742,7 +1743,7 @@ def peer_access_supported(max_num_gpus_per_node: int):
     if max_num_gpus_per_node <= 1:
         return False
 
-    if not torch.cuda.is_available():
+    if not device_module().is_available():
         # we are on cpu head node, so we need to check P2P access on a node with 2 GPUs
         ray.init()
         pg = placement_group([{"CPU": 1, "GPU": 2}], strategy="PACK")
