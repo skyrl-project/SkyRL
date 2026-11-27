@@ -31,11 +31,11 @@ from skyrl.backends.skyrl_train.distributed.megatron.quantization_utils import (
     resolve_auto_wire_format,
     validate_concrete_fp8_recipe,
 )
-from skyrl.backends.skyrl_train.utils.device import device_module, device_type
 from skyrl.backends.skyrl_train.kernels.nvfp4_quant import (
     BLOCK_SCALE_FOUR_OVER_SIX,
     flashinfer_nvfp4_env,
 )
+from skyrl.backends.skyrl_train.utils.device import device_module, device_type
 from skyrl.backends.skyrl_train.utils.io.io import is_cloud_path
 from skyrl.backends.skyrl_train.weight_sync.fp8 import (
     AUTO_FP8,
