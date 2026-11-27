@@ -18,6 +18,7 @@ from typing import Annotated, Any, Dict, List, Literal, Optional, Type, TypeVar,
 import yaml
 from omegaconf import DictConfig, OmegaConf
 
+from skyrl.train.fused_lm_head import FUSED_LM_HEAD_BACKENDS, FusedLmHeadBackend
 from skyrl_gym.envs.search.env import SearchEnvConfig
 from skyrl_gym.envs.sql.env import Text2SQLEnvConfig
 
@@ -551,6 +552,23 @@ DEFAULT_TRANSFORMER_CONFIG_KWARGS = {
 
 
 @dataclass
+class QatRoundingConfig(BaseConfig):
+    """How the trainer's QAT rounds one quantized tensor class (``expert_nvfp4``'s routed-expert weights or inputs, or
+    ``kv_cache_qat``'s cache rows). Trainer-only: the rollouts keep their own quantizer settings, so a setting that
+    differs from theirs makes the trainer round differently from the rollouts it emulates (logged at startup)."""
+
+    four_over_six: Optional[bool] = None
+    """NVFP4 4/6 block scales: per 16-block amax/6 or amax/4, whichever has the lower squared error.
+    FlashInfer's 4over6, instead of amax/6. ``None``: the rollouts' setting."""
+    stochastic_rounding: bool = False
+    """Round each scaled value stochastically to one of its two neighbours on its grid.
+    The grid is E2M1 (E4M3 for the KV cache's RoPE and ``fp8_ds_mla`` values); up with probability equal to its
+    distance from the lower one: unbiased, where round-to-nearest repeats the same error every time. Scales stay the
+    round-to-nearest grid's, one E4M3 step larger where an NVFP4 block's largest value would saturate. On sm_100 /
+    sm_103 the hardware's ``cvt.rs`` conversions round (8 random bits per value)."""
+
+
+@dataclass
 class MegatronConfig(BaseConfig):
     """Megatron-Core backend configuration, used when ``trainer.strategy="megatron"``.
 
@@ -651,7 +669,8 @@ class MegatronConfig(BaseConfig):
     rollout's FP8 modules are set separately by ``generator.inference_engine.fp8_weight_sync_exclude_modules``.
     Mutually exclusive with ``te_precision_config_file``."""
     num_layers_at_start_in_bf16: int = 0
-    """Number of leading transformer layers trained in BF16 instead of FP8. Layer numbers are global, so this
+    """Number of leading transformer layers trained in BF16 instead of FP8 (or, with ``expert_nvfp4``, whose
+    routed experts stay BF16 in the trainer and on the sampler). Layer numbers are global, so this
     works under pipeline parallelism. If this conflicts with a custom ``te_precision_config_file`` which indicates
     a layer to be FP8, this config wins and the layer is kept in BF16, unless that file's config for the layer sets
     ``override_nonquantized_autocast: true`` (Megatron defaults it to false), in which case the file wins and the
@@ -673,6 +692,8 @@ class MegatronConfig(BaseConfig):
     )
     """Pass-through kwargs for Megatron's ``TransformerConfig``:
     https://github.com/NVIDIA/Megatron-LM/blob/core_r0.13.0/megatron/core/transformer/transformer_config.py
+    Each key must be a field of ``TransformerConfig`` or of the model's Megatron-Bridge provider
+    (e.g. ``should_pad_vocab``); any other key raises an error when the model is built.
     Also the place to put HuggingFace config overrides (e.g. ``rope_parameters``) for the Megatron
     backend, where FSDP would use ``model_config_kwargs``.
 
@@ -696,9 +717,78 @@ class MegatronConfig(BaseConfig):
     optimizer is fully offloaded to CPU (``optimizer_cpu_offload=True`` with
     ``optimizer_offload_fraction=1.0``), whose step allocates little GPU memory.
     ``True`` / ``False`` force both empties on / off."""
+    expert_nvfp4: bool = False
+    """Train the routed experts on the NVFP4 grid vLLM serves, and sync the same NVFP4 expert weights to vLLM.
+    The trainer's routed experts (``*.experts.linear_fc1/fc2``) compute on that grid and the sync ships them as
+    ModelOpt NVFP4 (per-token activations on FlashInfer TRT-LLM, no re-quantization on the sampler), so the trainer's
+    logprobs follow the rollouts'. Everything else stays BF16, and so do the optimizer's master weights
+    (straight-through). ``expert_nvfp4_mode`` picks what the trainer rounds; ``expert_nvfp4_block_scale`` the block
+    scales of both sides. Requires ``moe_grouped_gemm``, expert TP 1 (``expert_tensor_parallel_size: 1``; set it
+    explicitly with ``tensor_model_parallel_size > 1``, Megatron defaults it to the TP size), the NCCL or CUDA-IPC
+    weight sync and SM100. The ref model mirrors the policy's setting.
+
+    ``num_layers_at_start_in_bf16`` / ``num_layers_at_end_in_bf16`` keep the routed experts of the first / last
+    N layers in BF16, in the trainer and on the sampler (the vLLM ignore list and the weight sync follow them)."""
+    expert_nvfp4_mode: Literal["w4a16", "w4a4"] = "w4a16"
+    """What the trainer rounds with ``expert_nvfp4`` (the rollouts are W4A4 either way).
+
+    ``w4a16`` (the default): only the routed-expert weights, in fprop and dgrad. It gave the best rollout-trainer
+    logprob match in GLM-5.3 and Qwen3-30B-A3B RL: trainer and rollout hidden states differ at depth (attention /
+    KV-cache numerics), so the two sides' 4-bit activation codes decorrelate while the identical weight rounding
+    cancels. Runs at about bf16 speed and memory, on any dispatcher.
+
+    ``w4a4``: also the per-token NVFP4 inputs of both expert GEMMs, as vLLM's W4A4 MoE quantizes them (wgrad reads
+    the rounded inputs), with the fprops on NVFP4 tensor cores (FlashInfer's CuTe DSL grouped GEMM). Needs whole
+    fc2-input rows on the engines (expert parallelism, or a single unsharded engine), and rejects ``moe_act``
+    recompute and ``expert_fc1`` / ``moe_act`` activation offloading.
+
+    Either way dgrad and wgrad run in BF16 on the rounded operands and the optimizer updates the unrounded weights."""
+    expert_nvfp4_block_scale: Literal["absmax", "four_over_six"] = "four_over_six"
+    """With ``expert_nvfp4``: the E4M3 block scales of the routed experts' NVFP4 weights and per-token activations.
+    ``four_over_six`` (humans&' recipe) picks amax/6 or amax/4 per 16-block, whichever has the lower squared error
+    (FlashInfer's 4over6 with its fast MSE error path, E4M3 bound 448); ``absmax`` (amax/6) is vLLM's own
+    quantizer. The weight sync quantizes the experts with it (FlashInfer ``fp4_quantize`` with vLLM's per-expert
+    global scale), and the vLLM engines' FlashInfer activation quantizer is configured from it, so it is the rollouts'
+    grid; the trainer rounds on it too unless ``expert_nvfp4_*_rounding.four_over_six`` says otherwise."""
+    expert_nvfp4_weight_rounding: QatRoundingConfig = field(default_factory=QatRoundingConfig)
+    """How the trainer rounds the routed-expert weights (``four_over_six`` defaults to ``expert_nvfp4_block_scale``).
+    Stochastic weights draw once per optimizer step and expert: every fprop, dgrad and recompute of a step, and every
+    rank holding the expert, round it alike."""
+    expert_nvfp4_activation_rounding: QatRoundingConfig = field(default_factory=QatRoundingConfig)
+    """How ``w4a4`` rounds the per-token expert inputs (``four_over_six`` defaults to ``expert_nvfp4_block_scale``).
+    Stochastic inputs draw afresh in every forward (activation recompute redraws the same)."""
+    expert_nvfp4_stacked_sync: bool = True
+    """With ``expert_nvfp4``: ship each NVFP4 MoE layer's experts to vLLM as 8 tensors stacked over all experts,
+    already in vLLM's ModelOpt-NVFP4 ``FusedMoE`` parameter layout (``weight_sync/nvfp4_stacked.py``), instead of
+    8 tensors per expert. vLLM then loads each layer with one copy per parameter and one
+    ``process_weights_after_loading`` instead of buffering and replaying ~1.5k per-expert loader calls through
+    its layerwise reload (~74k for a 48-layer, 128-expert model). Same quantization, same bytes; the receiver
+    falls back to the per-expert path for any layer it cannot load directly (MoE TP > 1, redundant experts,
+    unexpected shapes). NCCL or CUDA-IPC backend only. The BF16 layers are unaffected. On by default (parity with
+    the per-expert path is bitwise, see ``tests/backends/skyrl_train/gpu/gpu_ci/test_nvfp4_stacked_sync.py``); set
+    ``false`` to use the per-expert path. Ignored without ``expert_nvfp4``."""
+    kv_cache_qat: bool = False
+    """Attend over the rollouts' quantized KV cache in every absorbed-MLA (DSA) layer.
+    Each layer's keys and values become the dequantized cache rows the engines hold
+    (``engine_init_kwargs.kv_cache_dtype``: ``nvfp4_ds_mla`` or ``fp8_ds_mla``), built with vLLM's own cache writer
+    and reader arithmetic, so they are bit-identical to what the rollouts' attention reads. The rounding is
+    straight-through: the backward runs on the rounded keys and values, and their gradient reaches the unrounded key
+    unchanged. DeepSeek-V3.2 / GLM-5.x geometry; needs vLLM in the trainer env (and Blackwell for ``nvfp4_ds_mla``)
+    and ``engine_init_kwargs.attention_config.sparse_mla_force_mqa: true``, which makes every engine prefill read the
+    cache. Not supported with prefill-decode disaggregation (``enable_pd``). The ref model mirrors the policy's setting.
+    See
+    ``skyrl.backends.skyrl_train.workers.megatron.quantization.fake_kv_cache_qat``."""
+    kv_cache_qat_format: Optional[Literal["nvfp4_ds_mla", "fp8_ds_mla"]] = None
+    """The emulated KV cache format, set during config validation; leave unset.
+    Copied from ``generator.inference_engine.engine_init_kwargs.kv_cache_dtype``."""
+    kv_cache_qat_rounding: QatRoundingConfig = field(default_factory=QatRoundingConfig)
+    """How ``kv_cache_qat`` rounds the cache rows.
+    ``four_over_six`` (``nvfp4_ds_mla`` only) defaults to the rollouts' absmax (vLLM's cache writer has no 4/6).
+    Stochastic rows draw afresh in every forward (activation recompute redraws the same), on the E2M1 latent and E4M3
+    RoPE (``nvfp4_ds_mla``) or the E4M3 latent (``fp8_ds_mla``)."""
     model_config_kwargs: dict = field(default_factory=dict)
     """HF-config overrides read from the nested ``model_config`` key only.
-    Used for bridge and RoPE resolution. Not a general HF-config override -- use
+    Used for bridge resolution. Not a general HF-config override -- use
     ``transformer_config_kwargs`` instead."""
     dist_ckpt_optim_fully_reshardable: bool = False
     """When True, use the "fully-reshardable" format for the distributed-optimizer checkpoint.
@@ -764,6 +854,19 @@ class MegatronConfig(BaseConfig):
         # doesn't have to repeat every default just to set one value.
         if self.transformer_config_kwargs is None:
             self.transformer_config_kwargs = {}
+        # Megatron-Bridge builds the model from the checkpoint's own config, so these model_config overrides would
+        # never reach it (q_lora_rank used to, through a provider fixup that no longer exists). Checked here, where
+        # every entrypoint builds this config (SFT and Tinker never call validate_cfg), rather than in
+        # validate_megatron_cfg.
+        model_config_overrides = (self.model_config_kwargs or {}).get("model_config") or {}
+        unapplied = sorted(
+            {"rope_parameters", "rope_scaling", "rope_theta", "q_lora_rank"} & set(model_config_overrides)
+        )
+        if unapplied:
+            raise ValueError(
+                f"megatron_config.model_config_kwargs.model_config sets {unapplied}, which the Megatron backend does "
+                "not apply: Megatron-Bridge builds the model from the checkpoint's own config. Remove the override."
+            )
         # The top-level FP8 fields fold into the TransformerConfig kwargs; explicitly
         # configured kwargs take precedence.
         for key, value in (
@@ -774,8 +877,17 @@ class MegatronConfig(BaseConfig):
         ):
             if value is not None:
                 self.transformer_config_kwargs.setdefault(key, value)
-        if not is_fp8_enabled(self.transformer_config_kwargs.get("fp8", False)) and (
-            self.fp8_exclude_modules or self.num_layers_at_start_in_bf16 > 0 or self.num_layers_at_end_in_bf16 > 0
+        if self.expert_nvfp4 and (self.fp8_exclude_modules or self.te_precision_config_file):
+            raise ValueError(
+                "expert_nvfp4 needs BF16 routed-expert compute; fp8_exclude_modules and "
+                "te_precision_config_file are not supported with it."
+            )
+        # expert_nvfp4 reads num_layers_at_{start,end}_in_bf16 from the same Megatron first/last-layer kwargs, so the
+        # layer counts are valid with FP8 or with expert_nvfp4.
+        if (
+            not is_fp8_enabled(self.transformer_config_kwargs.get("fp8", False))
+            and not self.expert_nvfp4
+            and (self.fp8_exclude_modules or self.num_layers_at_start_in_bf16 > 0 or self.num_layers_at_end_in_bf16 > 0)
         ):
             raise ValueError(
                 "FP8 disabled but one or more of these quantization config is requested: exclude modules, num start/end layers to keep at BF16. "
@@ -816,6 +928,23 @@ class MegatronConfig(BaseConfig):
         if self.empty_cuda_cache is not None:
             return self.empty_cuda_cache
         return not expandable_segments
+
+    def check_expert_grid(self, world_size: int, prefix: str) -> None:
+        """Raise unless Megatron's expert grid (pp * ep * etp) divides ``world_size``, as Megatron requires at
+        startup even for a dense model. ``prefix`` is where this config sits, for the error message."""
+        pp, ep = self.pipeline_model_parallel_size, self.expert_model_parallel_size
+        # Megatron's own fallback: an unset expert_tensor_parallel_size is the tensor parallel size.
+        etp = (
+            self.tensor_model_parallel_size
+            if self.expert_tensor_parallel_size is None
+            else self.expert_tensor_parallel_size
+        )
+        if world_size % (pp * ep * etp):
+            raise ValueError(
+                f"world_size {world_size} should be divisible by Megatron's expert grid (pp * ep * etp) {pp * ep * etp}. "
+                f"{prefix}.expert_model_parallel_size and expert_tensor_parallel_size lay it out, and Megatron builds "
+                "it even for a dense model, where expert_model_parallel_size=1 works."
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1099,8 +1228,9 @@ class AlgorithmConfig(BaseConfig):
     """Normalize advantages by the (global) training-batch mean and standard deviation."""
     value_head_prefix: str = "value_head"
     """Name used to identify the value head in the critic model."""
-    policy_loss_type: str = "regular"
-    """Type of policy loss to use, or custom via ``PolicyLossRegistry``:
+    policy_loss_type: str = "dppo"
+    """Policy loss, defaulting to ``"dppo"``; register a custom one via ``PolicyLossRegistry``.
+    Available losses:
 
     - ``"regular"``: vanilla PPO loss with token-level importance sampling.
     - ``"dual_clip"``: dual-clip PPO loss (https://arxiv.org/pdf/1912.09729).
@@ -1124,8 +1254,9 @@ class AlgorithmConfig(BaseConfig):
     - ``"reinforce"``: plain policy gradient ``-A log π`` with no importance ratio, the objective
       score centering builds on (https://arxiv.org/abs/2609.20807).
     """
-    loss_reduction: str = "token_mean"
-    """Type of loss reduction to use, applied per mini-batch by rescaling advantages:
+    loss_reduction: str = "prompt_mean"
+    """Loss reduction defaults to ``"prompt_mean"`` and rescales advantages per mini-batch.
+    Available modes:
 
     - ``"token_mean"``: average loss over all valid tokens in the batch, as in DAPO
       (https://dapo-sia.github.io/).
@@ -1140,9 +1271,10 @@ class AlgorithmConfig(BaseConfig):
       tokens its responses contain.
     - ``"token_mean_legacy"``: also accepted, retaining the previous ``"token_mean"`` behavior.
     """
-    grpo_norm_by_std: bool = True
-    """Normalize advantages by the standard deviation in GRPO.
-    Set to False for Dr. GRPO (https://arxiv.org/abs/2503.20783)."""
+    grpo_norm_by_std: bool = False
+    """Normalize advantages by the per-prompt reward standard deviation in GRPO.
+    ``False`` (the default) follows Dr. GRPO (https://arxiv.org/abs/2503.20783); set ``True`` for
+    the original GRPO normalization."""
     zero_variance_filter: bool = False
     """Loss-mask prompts with zero-variance rewards. Only applicable when rewards are response-level."""
     zero_variance_filter_tol: float = 1e-6
@@ -1170,7 +1302,7 @@ class AlgorithmConfig(BaseConfig):
     enable_sample_support_replay: bool = False
     """Renormalize policy logprobs over the sampler's recorded bounded support. Requires
     ``generator.inference_engine.enable_return_sample_support_set`` to capture it."""
-    enable_score_centering: bool = False
+    enable_score_centering: Optional[bool] = None
     """Score centering (https://arxiv.org/abs/2609.20807): subtract each token's expected weighted
     score under the sampler, cancelling the drift a training-inference mismatch adds to the policy
     gradient.
@@ -1183,7 +1315,11 @@ class AlgorithmConfig(BaseConfig):
     ``cispo_anchor="rollout"`` (its clamp) or ``"dppo"`` (its trust region). Incompatible with
     ``off_policy_correction.tis_ratio_type`` and the token-mask IS thresholds, which weight only the
     sampled token by ``π_old / π_rollout``; sequence and outlier masks apply to both terms but are
-    approximate, because each depends on the sampled token's own ratio."""
+    approximate, because each depends on the sampled token's own ratio.
+
+    ``None`` (the default) resolves at config construction: ``True`` when
+    ``enable_sample_support_replay`` is on and the loss and off-policy correction settings above
+    allow it, otherwise ``False``. ``True`` raises if they do not."""
     sapo: SAPOConfig = field(default_factory=SAPOConfig)
     """Only used when ``policy_loss_type="sapo"``."""
     value_clip: float = 0.2
@@ -1218,10 +1354,23 @@ class FullyAsyncConfig(BaseConfig):
     """Indicates whether fully async training is enabled"""
     max_staleness_steps: int = 4
     """Maximum off-policy steps allowed. If a trajectory group is scheduled at step *i* and trained at step *j*,
-    then ``j - i <= max_staleness_steps``. Larger values increase throughput but also off-policy-ness."""
+    then ``j - i <= max_staleness_steps``. Larger values increase throughput but also off-policy-ness.
+
+    The colocated partial-rollout trainer also uses this field for admission. At most
+    ``max(num_parallel_generation_workers, policy_mini_batch_size * (max_staleness_steps + 1))`` groups
+    are not yet trained on. When ``policy_mini_batch_size * (max_staleness_steps + 1)`` is at most
+    ``num_parallel_generation_workers`` (always true for ``0``), a finished group holds its slot until
+    the step that trains on it. When it is larger, a finished group frees its slot at once. That trainer
+    sets no limit on the number of policy versions that generate one trajectory, so it does not guarantee
+    ``j - i <= max_staleness_steps``."""
     num_parallel_generation_workers: int = 768
     """Number of generation workers to spawn. Should be >= ``policy_mini_batch_size`` and
-    <= ``policy_mini_batch_size * (max_staleness_steps + 1)``."""
+    <= ``policy_mini_batch_size * (max_staleness_steps + 1)``.
+
+    For the colocated partial-rollout trainer, this is the number of groups in flight. It must be
+    >= ``policy_mini_batch_size``, and the upper bound does not apply: each step trains on the first
+    ``policy_mini_batch_size`` groups to finish, and the rest stay paused through training and resume
+    under the next policy version."""
     sample_full_batch: bool = False
     """Requires ``zero_variance_filter=True``. Drop zero-variance groups and keep pulling until the
     mini-batch is full of non-zero-variance groups (async-native DAPO ``dynamic_sampling="filter"``).
@@ -1232,6 +1381,11 @@ class FullyAsyncConfig(BaseConfig):
     """Whether or not to clear the KV cache on weight sync. Defaults to False.
     If False, we reuse KV cache from stale policies during generation
     (avoids recomputation at the cost of using slightly stale KV cache).
+
+    The colocated partial-rollout trainer keeps the in-flight requests paused in the inference engines
+    during training. With ``False``, it copies the KV cache to host memory for the training phase and
+    restores it, so the host needs memory for the KV pools of all inference engines. With ``True``, it
+    discards the KV cache, and the inference engines prefill the paused requests again.
     """
 
     # --- Trainer simulation (no real trainer components) ---
@@ -1780,6 +1934,18 @@ class TrainerConfig(BaseConfig):
     longer than ``max_tokens_per_microbatch`` is placed alone in its own microbatch that exceeds the
     cap (no error, no truncation). The true peak microbatch size is therefore
     ``max(max_tokens_per_microbatch, longest_sequence_in_batch)``."""
+    balance_dp_tokens: bool = False
+    """Balance tokens across data-parallel ranks.
+
+    When False (the default), the behavior is the same as before this option existed. A batch is
+    cut into ``dp_size`` chunks with the same number of samples, in batch order. Samples of one
+    prompt have similar lengths and are next to each other, so some ranks get many more tokens
+    than others. The lighter ranks then wait for the busiest rank in every collective.
+
+    When True, the driver deals the samples of each batch (or mini-batch) to the ranks by length.
+    Every rank still gets the same number of samples, and the ranks get similar numbers of tokens.
+    Each rank forms its micro-batches as before, so this option does not depend on
+    ``max_tokens_per_microbatch``. Outputs keep the batch order."""
     recompute_old_logprobs_per_minibatch: bool = True
     """When True, recomputes policy/ref model logprobs (and critic values) per mini-batch using
     the same mini-batch + DP partition as the training step. When False, a single full-batch forward is run.
@@ -1812,6 +1978,13 @@ class TrainerConfig(BaseConfig):
     See https://docs.skyrl.ai/docs/checkpointing-logging/logging"""
     enable_ray_gpu_monitor: bool = True
     """Enable background Ray GPU/RAM metrics collection and logging to wandb."""
+    log_mfu: bool = True
+    """Log model FLOPs utilization (MFU) metrics for policy training each step.
+
+    Logs ``trainer/mfu``, ``trainer/mfu_e2e``, ``trainer/model_tflops_per_gpu``,
+    ``trainer/flops_per_token`` and, under full activation recompute, ``trainer/hfu_est``. Megatron
+    only; not logged for LoRA or with active MTP heads, and the utilization ratios are not logged for
+    FP8 training or on GPUs without a known peak."""
     tags: Optional[List[str]] = None
     """Optional list of tags to apply to the W&B run. Has no effect on other backends."""
     dump_data_batch: bool = False
@@ -1856,9 +2029,13 @@ class TrainerConfig(BaseConfig):
     materialized. Metric-only entropy and ``use_entropy_loss`` share the same
     projection. Uses ``logprobs_chunk_size`` to bound peak memory."""
     fused_lm_head_logprob_backend: str = "torch"
-    """Fused LM-head backend: ``"torch"`` (default) or ``"triton"``.
-    The Triton backend requires CUDA + triton and falls back to ``"torch"``
-    when unavailable. Ignored unless ``fused_lm_head_logprob`` is true."""
+    """Fused LM-head backend: ``"torch"``, ``"triton"``, or
+    ``"triton_block_sparse"``. The block-sparse backend preserves token order
+    and skips wholly inactive loss-mask row tiles for SFT or RL. It can regress
+    near a fully active mask; select it only after benchmarking representative
+    masks and sharding. Sample-support replay is not supported. Triton backends
+    require CUDA + triton and fall back to ``"torch"`` when unavailable.
+    Ignored unless ``fused_lm_head_logprob`` is true."""
 
     grafana_annotations: GrafanaAnnotationsConfig = field(default_factory=GrafanaAnnotationsConfig)
     """Optional Grafana run annotation publishing, disabled by default."""
@@ -1912,11 +2089,16 @@ class TrainerConfig(BaseConfig):
                 "adapter on output_layer; remove output_layer from trainer.policy.model.lora.target_modules "
                 "or disable fused_lm_head_logprob."
             )
-        if self.fused_lm_head_logprob_backend not in ("torch", "triton"):
+        if self.fused_lm_head_logprob_backend not in FUSED_LM_HEAD_BACKENDS:
             raise ValueError(
-                "fused_lm_head_logprob_backend must be 'torch' or 'triton', "
+                f"fused_lm_head_logprob_backend must be one of {FUSED_LM_HEAD_BACKENDS}, "
                 f"got {self.fused_lm_head_logprob_backend!r}."
             )
+        if (
+            self.fused_lm_head_logprob_backend == FusedLmHeadBackend.TRITON_BLOCK_SPARSE
+            and not self.fused_lm_head_logprob
+        ):
+            raise ValueError("fused_lm_head_logprob_backend='triton_block_sparse' requires fused_lm_head_logprob=True.")
         if self.vocab_entropy_chunk_size is not None and (
             isinstance(self.vocab_entropy_chunk_size, bool)
             or not isinstance(self.vocab_entropy_chunk_size, int)
@@ -2088,6 +2270,34 @@ def build_nested_dataclass(datacls: Type[T], d: dict) -> T:
 # ---------------------------------------------------------------------------
 
 
+def _score_centering_incompatibility(algorithm: AlgorithmConfig) -> Optional[str]:
+    """Why score centering cannot run with ``algorithm``, or ``None`` if it can."""
+    if not algorithm.enable_sample_support_replay:
+        return "trainer.algorithm.enable_score_centering requires enable_sample_support_replay"
+    from skyrl.backends.skyrl_train.utils.ppo_utils import score_centering_weight
+
+    try:
+        # Raises for a loss whose weight is not relative to the sampler.
+        score_centering_weight(algorithm.policy_loss_type, algorithm)
+    except ValueError as e:
+        return str(e)
+    off_policy = algorithm.off_policy_correction
+    # The deprecated use_tis becomes tis_ratio_type="token" only later, in validate_cfg.
+    if off_policy.tis_ratio_type is not None or algorithm.use_tis:
+        return (
+            "score centering does not compose with off_policy_correction.tis_ratio_type (or the deprecated "
+            "use_tis), which weights only the sampled token by pi_old / pi_rollout; the loss's own weight is "
+            "the importance correction (rollout_is's band, or cispo's clamp with cispo_anchor='rollout' for TIS)"
+        )
+    if off_policy.token_mask_is_threshold_low is not None or off_policy.token_mask_is_threshold_high is not None:
+        return (
+            "score centering does not compose with the token_mask_is_threshold_* masks, which drop "
+            "sampled tokens by pi_old / pi_rollout; rollout_is's eps_clip band is the masked "
+            "importance weight that score centering applies to every support member"
+        )
+    return None
+
+
 @dataclass
 class SkyRLTrainConfig(BaseConfig):
     """Root configuration object for SkyRL training with the ``fsdp`` and ``megatron`` backends.
@@ -2130,31 +2340,11 @@ class SkyRLTrainConfig(BaseConfig):
                 )
 
         algorithm = self.trainer.algorithm
-        if algorithm.enable_score_centering:
-            from skyrl.backends.skyrl_train.utils.ppo_utils import (
-                score_centering_weight,
-            )
-
-            if not algorithm.enable_sample_support_replay:
-                raise ValueError("trainer.algorithm.enable_score_centering requires enable_sample_support_replay")
-            # Raises for a loss whose weight is not relative to the sampler.
-            score_centering_weight(algorithm.policy_loss_type, algorithm)
-            off_policy = algorithm.off_policy_correction
-            if off_policy.tis_ratio_type is not None:
-                raise ValueError(
-                    "score centering does not compose with off_policy_correction.tis_ratio_type, which weights "
-                    "only the sampled token by pi_old / pi_rollout; the loss's own weight is the importance "
-                    "correction (rollout_is's band, or cispo's clamp with cispo_anchor='rollout' for TIS)"
-                )
-            if (
-                off_policy.token_mask_is_threshold_low is not None
-                or off_policy.token_mask_is_threshold_high is not None
-            ):
-                raise ValueError(
-                    "score centering does not compose with the token_mask_is_threshold_* masks, which drop "
-                    "sampled tokens by pi_old / pi_rollout; rollout_is's eps_clip band is the masked "
-                    "importance weight that score centering applies to every support member"
-                )
+        if algorithm.enable_score_centering is not False:
+            reason = _score_centering_incompatibility(algorithm)
+            if algorithm.enable_score_centering and reason is not None:
+                raise ValueError(reason)
+            algorithm.enable_score_centering = reason is None
 
         # Eval requests opt out of capture and do not use these constraints.
         if self.generator.inference_engine.enable_return_sample_support_set:
