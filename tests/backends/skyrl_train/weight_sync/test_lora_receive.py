@@ -102,6 +102,46 @@ def _run_round(engine, update_info=None):
     engine.finish_weight_update()
 
 
+class _FakeNcclCachingVllmEngine(_FakeVllmEngine):
+    """vLLM 0.33's NCCL receiver caches each round's update info keyed by ``self.model``.
+
+    It sits below SkyRL's mixin in the MRO, as the real vLLM engine does, so it sees the
+    per-round proxy the mixin installs rather than the base model.
+    """
+
+    def receive_weights(self, update_info):
+        self._last_update_info[self.model] = update_info
+        self.proxies.append(weakref.ref(self.model))
+        super().receive_weights(update_info)
+
+
+class _NcclCachingEngine(SkyrlReceiveLifecycleMixin, _FakeNcclCachingVllmEngine):
+    def __init__(self, weights):
+        super().__init__(weights)
+        self.device = "cpu"
+        self.loaded = []
+        self.model = _FakeModel(self.loaded)
+        self.vllm_config = SimpleNamespace(lora_config=object())
+        self._last_update_info = {}
+        self.proxies = []
+
+
+@pytest.mark.parametrize("armed", [True, False], ids=["lora_round", "base_round"])
+def test_no_round_proxy_outlives_its_round(armed):
+    """The per-round proxy (and, for a LoRA round, the adapter copy its closure stages on the GPU)
+    must not stay reachable through vLLM's update-info cache after the round."""
+    import gc
+
+    engine = _NcclCachingEngine([("a", torch.ones(1))])
+    for _ in range(2):
+        if armed:
+            engine.skyrl_set_lora_receive_target(build_lora_receive_target("t", {}, {}))
+        _run_round(engine)
+    gc.collect()
+    assert engine._last_update_info == {}
+    assert all(ref() is None for ref in engine.proxies)
+
+
 class TestArmedRound:
     def test_stages_the_adapter_and_never_touches_the_model(self):
         buffer = torch.arange(6, dtype=torch.float32)
@@ -286,3 +326,54 @@ def test_fp8_hooks_bracket_only_full_weight_updates(monkeypatch, lora_armed):
     else:
         assert engine.calls == ["before", "start", "receive", "finish", "after", "empty_cache"]
         assert len(engine.loaded) == 1
+
+
+class _ChunkedEngine(_Engine):
+    """vLLM 0.33's packed IPC: one update round arrives as several ``receive_weights`` calls."""
+
+    def __init__(self, chunks):
+        super().__init__(chunks[0], lora_enabled=False)
+        self._chunks = list(chunks)
+
+    def receive_weights(self, update_info):
+        self._weights = self._chunks.pop(0)
+        super().receive_weights(update_info)
+
+
+def test_a_stacked_nvfp4_layer_may_span_receive_calls(monkeypatch):
+    """A stacked NVFP4 layer split across packed IPC chunks is loaded once, after its last tensor arrives,
+    and an update that ends with a layer still incomplete fails at ``finish_weight_update``."""
+    from skyrl.backends.skyrl_train.weight_sync.nvfp4_stacked import (
+        STACKED_LEAVES,
+        stacked_wire_name,
+    )
+    from skyrl.backends.skyrl_train.weight_sync.nvfp4_stacked_receive import (
+        Nvfp4StackedReceiver,
+    )
+
+    loaded_layers = []
+    monkeypatch.setattr(Nvfp4StackedReceiver, "_load_layer", lambda self, prefix, stacks: loaded_layers.append(prefix))
+    prefix = "model.layers.3.mlp.experts"
+    wire = [(stacked_wire_name(prefix, leaf), torch.ones(1)) for leaf in STACKED_LEAVES]
+    half = len(wire) // 2
+
+    engine = _ChunkedEngine([wire[:half], wire[half:]])
+    engine.start_weight_update()
+    engine.receive_weights(None)
+    engine.receive_weights(None)
+    engine.finish_weight_update()
+    assert loaded_layers == [prefix]
+
+    engine = _ChunkedEngine([wire[:half]])
+    engine.start_weight_update()
+    engine.receive_weights(None)
+    with pytest.raises(RuntimeError, match="incomplete layers"):
+        engine.finish_weight_update()
+
+    # A failed round leaves nothing behind for the next one.
+    engine = _ChunkedEngine([wire])
+    engine._skyrl_nvfp4_stacked = Nvfp4StackedReceiver(engine.model, fallback_load=None)
+    engine._skyrl_nvfp4_stacked.pending[prefix] = {}
+    loaded_layers.clear()
+    _run_round(engine)
+    assert loaded_layers == [prefix]

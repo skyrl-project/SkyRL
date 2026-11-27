@@ -34,7 +34,6 @@ from vllm.utils.system_utils import set_ulimit
 
 from skyrl.backends.skyrl_train.inference_servers.common import (
     ServerInfo,
-    compute_dp_master_port,
     default_bind_host,
     find_and_reserve_port,
     format_http_url,
@@ -251,13 +250,6 @@ class VLLMServerActor(ServerActorProtocol):
         os.environ["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "1"
         # TODO (aaron): once native ipc stops needing this, remove
         os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
-        # Give this engine's workers a TCPStore probe window disjoint from every
-        # other engine's -- see `_seed_dp_master_port` for why. Derived from the
-        # assigned `start_port` rather than the reserved `self._port`, since only
-        # the former is guaranteed `SERVER_PORT_STRIDE` apart across actors.
-        # TODO: delete once vllm#50969 lands -- see the removal checklist on
-        # `compute_dp_master_port` in inference_servers/common.py.
-        os.environ["VLLM_DP_MASTER_PORT"] = str(compute_dp_master_port(start_port))
 
         # Configure the distributed executor backend
         self._cli_args.distributed_executor_backend = distributed_executor_backend
@@ -277,14 +269,6 @@ class VLLMServerActor(ServerActorProtocol):
             from skyrl.backends.skyrl_train.inference_servers.utils import (
                 get_pd_p2p_connector_name,
             )
-            from skyrl.backends.skyrl_train.patches.vllm.patch_multi_connector_stats import (
-                apply_multi_connector_stats_patch,
-            )
-
-            # MultiConnector stacks (e.g. Mooncake P2P + store) crash the
-            # AsyncLLM output handler when a child has stats but no prom
-            # metrics; patch before the engine is built in this process.
-            apply_multi_connector_stats_patch()
 
             # Handle both dict and JSON string formats for kv_transfer_config
             kv_config = getattr(self._cli_args, "kv_transfer_config", None)
@@ -705,41 +689,6 @@ class VLLMServerActor(ServerActorProtocol):
                 pass
 
 
-def _seed_dp_master_port(http_port: int) -> None:
-    """Give vLLM's ray executor a private TCPStore port window.
-
-    ``RayExecutorV2`` (the default for ``distributed_executor_backend="ray"``)
-    picks the port for the engine's workers' ``torch.distributed`` group by
-    probing ``[VLLM_DP_MASTER_PORT + 100 + 32 * local_dp_rank, +32)`` and taking
-    the first port whose bind succeeds. With DP disabled ``ParallelConfig`` falls
-    back to the env defaults -- ``VLLM_DP_MASTER_PORT`` is 0, and
-    ``VLLM_DP_RANK_LOCAL`` defaults to ``VLLM_DP_RANK`` (0) rather than ``None``,
-    which would have routed us to vLLM's random-port branch -- so *every* engine
-    on the node probes the same window starting at port 100.
-
-    On a host where unprivileged ports start at 1024, all 32 probes fail and vLLM
-    falls back to a random port. But containers commonly set
-    ``net.ipv4.ip_unprivileged_port_start=0``, and there the probe *succeeds*:
-    since it closes the socket before TCPStore binds, two co-located engines both
-    settle on port 100 and the second dies with ``EADDRINUSE``.
-
-    The fix is disjoint windows, not a reserved port -- vLLM probes a 32-port
-    range, so there is no single port to hold. ``VLLMServerActor`` seeds this in
-    ``__init__`` from its group-assigned ``start_port``, which is unique per
-    actor; this call only takes effect on the standalone ``python -m`` path, where
-    the server owns its whole port window anyway.
-
-    Ignored when DP is enabled: vLLM overwrites ``data_parallel_master_port`` from
-    ``get_open_ports_list()`` on that path and leaves ``data_parallel_rank_local``
-    as ``None``, which reaches the random-port branch.
-
-    TODO: delete this function and its call site once vllm#50969 lands -- see the
-    removal checklist on ``compute_dp_master_port`` in
-    ``inference_servers/common.py``.
-    """
-    os.environ.setdefault("VLLM_DP_MASTER_PORT", str(compute_dp_master_port(http_port)))
-
-
 async def _build_and_serve_vllm_server(
     cli_args: Namespace,
     *,
@@ -752,8 +701,6 @@ async def _build_and_serve_vllm_server(
     Shared by ``VLLMServerActor._run_server`` (Ray-actor deployment) and the
     standalone ``python -m`` entrypoint below.
     """
-    _seed_dp_master_port(cli_args.port)
-
     sock_addr = (cli_args.host, cli_args.port)
     # One uvicorn per port (no api_server_count fan-out), matching vLLM's own
     # single-server path, so SO_REUSEPORT stays off.
@@ -835,7 +782,7 @@ def _build_standalone_cli_args(argv: Optional[List[str]] = None) -> Namespace:
     ``--worker-extension-cls``, ...).
     """
     from vllm import AsyncEngineArgs as _AsyncEngineArgs
-    from vllm.entrypoints.launchers.cli_args import FrontendArgs
+    from vllm.entrypoints.common.cli_args import FrontendArgs
     from vllm.platforms import current_platform
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 

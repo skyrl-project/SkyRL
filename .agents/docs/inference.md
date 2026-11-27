@@ -25,9 +25,14 @@ Prefill-Decode disaggregation:
   `MooncakeStoreConnector` for KV offloading):
     - `NixlConnector` — pull-based default (NIXL side channel).
     - `MooncakeConnector` — push-based (bootstrap-server handshake). The router runs in `kv_connector=mooncake` mode and
-      is given each prefill server's mooncake bootstrap server port. The `MultiKVConnectorPromMetrics.observe` monkeypatch
-      (`patches/vllm/patch_multi_connector_stats.py`) is applied to avoid an assert-crash when a child connector
-      reports stats without Prometheus metrics.
+      is given each prefill server's mooncake bootstrap server port.
+- **Sleep mode.** SkyRL enables vLLM sleep mode whenever `placement.colocate_all` or `offload_kv_for_weight_sync` is
+  set. From vLLM 0.33 the engine refuses sleep mode for connectors that cannot follow the KV-cache remap
+  (`supports_sleep_mode`): `MooncakeConnector` only over RDMA (`mooncake_protocol: rdma`, no `MC_FORCE_MNNVL` /
+  `MC_INTRANODE_NVLINK` / `MC_USE_TENT` / `MC_USE_TEV1`), `NixlConnector` only with the UCX backend, and never the
+  NIXL push connector or `MooncakeStoreConnector`. A `MultiConnector` supports sleep mode only if every child does,
+  so Mooncake + MooncakeStore can never run colocated. Such a PD setup must run non-colocated without KV offload;
+  otherwise the engine fails at start with `... does not support sleep mode.`
 - **Role-specific engine kwargs**: `prefill_init_kwargs` and `decode_init_kwargs` are per-role pass-through vLLM engine
   kwargs (e.g. a different `all2all_backend`, or per-role `kv_role`) applied on top of the base args by
   `get_pd_cli_args`. They are **mutually exclusive** with `engine_init_kwargs` and require `enable_pd=true`; when used,
@@ -52,7 +57,7 @@ Prefill-Decode disaggregation:
 ## Key Config Knobs
 
 All under `generator.inference_engine.*`:
-- `enforce_eager` (bool, default true): With `enforce_eager=false`, there can be more mismatch between inference logprobs and trainer logprobs. It is recommended to use off policy correction methods like Truncated Importance Sampling (see `docs/content/docs/algorithms/off_policy_correction.mdx` for details) to prevent logprobs drift. 
+- `enforce_eager` (bool, default false): The default `enforce_eager=false` enables CUDA graphs and torch.compile in vLLM, which can increase the mismatch between inference logprobs and trainer logprobs. It is recommended to use off policy correction methods like Truncated Importance Sampling (see `docs/content/docs/algorithms/off_policy_correction.mdx` for details) to prevent logprobs drift. Set `enforce_eager=true` to run vLLM in eager mode.
 - `gpu_memory_utilization` (float, default 0.8)
 - `max_num_batched_tokens` (int, default 8192)
 - `max_num_seqs` (int, default 1024)

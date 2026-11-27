@@ -8,7 +8,8 @@
 - ``FakeTrial``: what Harbor's ``Trial`` is to the generator. Its task path picks
   a script: a linear chat, a summarization (the history is rewritten), a
   discarded reply asked again for (mini-swe-agent's format-error retry), a
-  timeout, an agent that exits on skycap's context-length error (``overflow``), a crash, or a sandbox that times out starting on the first attempt
+  timeout, a timeout before the agent's first model call (``stuck``), an agent that exits on skycap's context-length
+  error (``overflow``), a crash, or a sandbox that times out starting on the first attempt
   (``slow_start``; "first" counts every trial of that task path since
   ``FakeTrial.configs`` was reset, so a test runs one such trial). Results carry Harbor's phase timings: the sandbox takes
   ``SETUP`` seconds to start, the agent ``AGENT`` and the verifier ``VERIFY``.
@@ -193,8 +194,12 @@ class FakeTrial:
         script = str(self.config["task"]["path"])
         kwargs = self.config["agent"]["kwargs"]
         # As the agent finds its endpoint: an installed one in the sandbox's environment, Terminus-2 in its kwargs.
+        # Harbor's Codex reads only OPENAI_BASE_URL (it writes it into Codex's config.toml) and ignores api_base.
         env = self.config["agent"].get("env") or {}
-        base_url = env.get("OPENAI_API_BASE") or kwargs["api_base"]
+        if self.config["agent"]["name"] == "codex":
+            base_url = env.get("OPENAI_BASE_URL")
+        else:
+            base_url = env.get("OPENAI_API_BASE") or kwargs["api_base"]
         # And its key, as an OpenAI client sends it: from the environment, or Terminus-2's llm_kwargs.
         api_key = env.get("OPENAI_API_KEY") or kwargs.get("llm_kwargs", {}).get("api_key")
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
@@ -216,6 +221,9 @@ class FakeTrial:
                 return verified(1.0, timed=False)
             if script == "slow_start" and attempt == 0:
                 return start_timed_out()
+            if script == "stuck":
+                # Timed out before the agent's first model call, so skycap captured nothing.
+                return verified(0.0, "AgentTimeoutError")
             history = [{"role": "user", "content": script}]
             history.append(await chat(session, history))
             if script == "timeout":

@@ -54,6 +54,7 @@ from skyrl.backends.skyrl_train.weight_sync.fp8 import (
     SKYRL_BATCHED_MOE_FP8_PREFIX,
     batched_moe_wire_targets,
 )
+from skyrl.backends.skyrl_train.weight_sync.nvfp4_stacked import NVFP4_STACKED_PREFIX
 from skyrl.backends.skyrl_train.weight_sync.sharded_rdt.rdt_libfabric_shim import (
     ensure_ray_rdt_libfabric,
 )
@@ -181,9 +182,8 @@ from skyrl.backends.skyrl_train.patches.vllm.patch_routed_experts_pp_relay impor
 
 apply_pp_relay_worker_patch()
 
-# DeepSeek-V4 under layerwise reload (weight sync): load attention sinks through a weight loader and run the
-# model-level finalize once per reload, as vllm-project/vllm#57797 (merged) and #64357 (open) do upstream.
-# TODO: remove once the pinned vLLM includes both (see the module docstring).
+# DeepSeek-V4 under layerwise reload (weight sync): run the model-level finalize once per reload, as
+# vllm-project/vllm#64357 (open) does upstream. TODO: remove once the pinned vLLM includes it.
 from skyrl.backends.skyrl_train.patches.vllm.patch_deepseek_v4_reload import (  # noqa: E402
     apply_deepseek_v4_reload_patch,
 )
@@ -191,20 +191,12 @@ from skyrl.backends.skyrl_train.patches.vllm.patch_deepseek_v4_reload import (  
 apply_deepseek_v4_reload_patch()
 
 # A PP stage with no layers of some KV cache group gets cache tensors for layers it does not own (DeepSeek-V4.1 at PP=2).
-# TODO: remove once the pinned vLLM includes vllm-project/vllm#60234 (on main, not in 0.32.0).
+# TODO: remove once the pinned vLLM includes vllm-project/vllm#60234 (on main, not in 0.33.0).
 from skyrl.backends.skyrl_train.patches.vllm.patch_pp_kv_cache_projection import (  # noqa: E402
     apply_pp_kv_cache_projection_patch,
 )
 
 apply_pp_kv_cache_projection_patch()
-
-# DeepSeek-V4.1 BF16 prefill reads unwritten rows of a reused KV workspace; NaN leftovers make a request's logits
-# NaN. Zero the workspace before each gather. TODO: remove once vllm-project/vllm#60613 is in the pinned vLLM.
-from skyrl.backends.skyrl_train.patches.vllm.patch_deepseek_v41_prefill_workspace import (  # noqa: E402
-    apply_deepseek_v41_prefill_workspace_patch,
-)
-
-apply_deepseek_v41_prefill_workspace_patch()
 
 
 VLLM_NEW_INFERENCE_WORKER_EXTENSION_CLS = f"{__name__}.NewInferenceWorkerWrap"
@@ -301,9 +293,14 @@ def _load_batched_moe_fp8_tensor(
 def _load_checkpoint_weights(
     model: torch.nn.Module,
     weights: Iterable[tuple[str, torch.Tensor]],
+    nvfp4_stacked_receiver: Any = None,
     **kwargs: Any,
 ) -> Any:
-    """Load ordinary checkpoint tensors and compact batched-MoE FP8 tensors."""
+    """Load ordinary checkpoint tensors, compact batched-MoE FP8 tensors and stacked NVFP4 expert layers.
+
+    Stacked NVFP4 tensors (``weight_sync/nvfp4_stacked.py``) go to ``nvfp4_stacked_receiver``, which holds a
+    layer's tensors until all 8 have arrived (possibly across calls) and then loads the layer in one pass.
+    """
     params_dict: dict[str, torch.nn.Parameter] | None = None
     ordinary_weights: list[tuple[str, torch.Tensor]] = []
     for name, weight in weights:
@@ -311,8 +308,14 @@ def _load_checkpoint_weights(
             if params_dict is None:
                 params_dict = dict(model.named_parameters())
             _load_batched_moe_fp8_tensor(model, params_dict, name, weight)
+        elif name.startswith(NVFP4_STACKED_PREFIX):
+            if nvfp4_stacked_receiver is None:
+                raise RuntimeError(f"Received stacked NVFP4 tensor {name!r} without a stacked receiver")
+            nvfp4_stacked_receiver.accept(name, weight)
         else:
             ordinary_weights.append((name, weight))
+    if nvfp4_stacked_receiver is not None:
+        nvfp4_stacked_receiver.end_of_batch()
     if ordinary_weights:
         return model.load_weights(weights=ordinary_weights, **kwargs)
     return set()
@@ -357,6 +360,24 @@ class NewInferenceWorkerWrap:
             )
         arm(receive_target)
 
+    def skyrl_param_digest(self) -> dict:
+        """Diagnostic: ``{name: "shape|dtype|blake2b"}`` over every parameter and buffer of the live model.
+
+        Used to check that two weight-sync paths leave bitwise the same model on the sampler. Copies each tensor to host to hash it; seconds per GB, not for training loops.
+        """
+        import hashlib
+        import itertools
+
+        model = self.model_runner.model
+        out = {}
+        for name, tensor in itertools.chain(model.named_parameters(), model.named_buffers()):
+            data = tensor.detach().contiguous().reshape(-1)
+            digest = hashlib.blake2b(digest_size=16)
+            if data.numel():
+                digest.update(memoryview(data.view(torch.uint8).cpu().numpy()))
+            out[name] = f"{tuple(tensor.shape)}|{tensor.dtype}|{digest.hexdigest()}"
+        return out
+
     def skyrl_discard_in_memory_lora(self, lora_name: str) -> bool:
         """Free the staged tensors of an unloaded in-memory adapter.
 
@@ -381,11 +402,13 @@ class NewInferenceWorkerWrap:
     # abort, no prefill recompute. Mirrors GPUWorker.sleep/wake_up; re-verify on
     # vLLM bumps.
 
-    def skyrl_sleep_for_weight_sync(self, offload_kv: bool = True) -> None:
+    def skyrl_sleep_for_weight_sync(self, offload_kv: bool = True, offload_weights: bool = False) -> None:
         """Free GPU memory for weight sync by sleeping the allocator.
 
-        Weights are discarded rather than backed up since the broadcast overwrites
-        every parameter on wake. ``offload_kv`` controls whether the KV cache is
+        By default, weights are discarded rather than backed up since the broadcast
+        overwrites every parameter on wake. ``offload_weights=True`` offloads them to
+        CPU instead: a LoRA adapter sync does not send the base model again, so the
+        wake must restore it. ``offload_kv`` controls whether the KV cache is
         offloaded to CPU (preserved for frozen in-flight requests) or discarded. Model
         buffers live in the weights pool but are not sent by the broadcast (e.g.
         non-persistent rotary ``inv_freq``), so save them here and restore on
@@ -408,6 +431,8 @@ class NewInferenceWorkerWrap:
         )
         self._skyrl_saved_model_state = save_model_state_tensors(self.model_runner)
         offload_tags = ("runtime", "cudagraph", "kv_cache") if offload_kv else ("runtime", "cudagraph")
+        if offload_weights:
+            offload_tags += ("weights",)
         get_mem_allocator_instance().sleep(offload_tags=offload_tags)
 
     def skyrl_wake_for_weight_sync(self, tags: list) -> None:
