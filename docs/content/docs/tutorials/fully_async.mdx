@@ -104,6 +104,11 @@ For fully async specifically, the following are the main knobs to tune:
   avoiding recomputation at the cost of using slightly stale KV cache. Set to `true` to match synchronous RL behavior.
   Note that prefix-cache blocks are still isolated per policy version by `generator.use_cache_salt` (on by default), so
   cache is reused within a weight version and not shared across versions.
+- `trainer.fully_async.save_during_eval`: When `true`, the checkpoint and the HF model export that are due at an eval
+  step run on the trainer workers while the eval runs on the inference engines. The next step starts when both end.
+  This also applies to callback-requested evals and checkpoints. `on_save` fires when the checkpoint completes,
+  which can be before `on_eval_end`. Use this option when your eval and its callbacks can run without the trainer workers.
+  Defaults to `false`, which runs the eval first and the saves after it.
 
 On GPU placement: first disable colocation of training and generation (to keep them on the same GPUs instead, see [V. Colocated partial rollout](#v-colocated-partial-rollout)), then configure how many GPUs to dedicate to training and generation respectively. The following snippet dedicates 4 GPUs to each.
 
@@ -355,6 +360,8 @@ The trainer does not support `trainer.fully_async.sample_full_batch=true` or `tr
 
 - `false` (the default) copies the KV cache to host memory for the training phase and restores it. A request resumes with no prefill. Its next tokens continue from KV states of the older weights. Each step pays one copy of the KV pool to host memory and back, and the host needs memory for the KV pools of all engines (about 60 GiB per GPU for Qwen3-4B on H100).
 - `true` discards the KV cache. The inference engine prefills the paused requests again with the new weights.
+
+`trainer.fully_async.save_during_eval` does not affect this trainer. The saves run before the weight sync, while the inference engines sleep.
 
 With a LoRA adapter sync, the trainer also copies the base model to host memory for the training phase, because the sync does not send it again.
 

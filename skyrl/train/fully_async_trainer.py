@@ -497,7 +497,8 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         """Write the step's checkpoint and its Hugging Face (HF) export.
 
         The loop writes each one at its interval, at the last step of the epoch, or when a callback
-        requested a save. The loop calls it after eval, or before the weight sync when
+        requested a save. The loop calls it after eval, during eval with
+        ``trainer.fully_async.save_during_eval``, or before the weight sync when
         ``_checkpoint_before_weight_sync`` returns ``True``."""
         ckpt_interval_save = self.cfg.trainer.ckpt_interval > 0 and (
             is_epoch_end or self.global_step % self.cfg.trainer.ckpt_interval == 0
@@ -760,15 +761,25 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                         self.global_step % self.cfg.trainer.eval_interval == 0
                         or self.global_step == self.total_training_steps
                     )
+                    save_task = None
                     if force_eval or interval_eval:
                         self._fire("on_eval_start")
-                        with self._phase_gauge.timed_phase("eval", self.all_timings):
-                            eval_metrics = await self.eval()
-                            self.all_metrics.update(eval_metrics)
-                        self._fire("on_eval_end", metrics=eval_metrics)
+                        if self.cfg.trainer.fully_async.save_during_eval and not ckpt_first:
+                            save_task = asyncio.create_task(self._save_step_checkpoints(force_save, is_epoch_end))
+                        try:
+                            with self._phase_gauge.timed_phase("eval", self.all_timings):
+                                eval_metrics = await self.eval()
+                                self.all_metrics.update(eval_metrics)
+                            self._fire("on_eval_end", metrics=eval_metrics)
+                        except BaseException:
+                            if save_task is not None:
+                                await self._wait_for_save_after_failed_eval(save_task)
+                            raise
 
                     # 7. Checkpointing. At interval, at the last step of each epoch, and when a callback asks.
-                    if not ckpt_first:
+                    if save_task is not None:
+                        await save_task
+                    elif not ckpt_first:
                         await self._save_step_checkpoints(force_save, is_epoch_end)
 
                     log_payload = {**self.all_metrics, **{"timing/" + k: v for k, v in self.all_timings.items()}}
@@ -884,6 +895,18 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         self._fire("on_train_end")
         self.tracker.finish()
         logger.info("Training done!")
+
+    async def _wait_for_save_after_failed_eval(self, save_task: asyncio.Task) -> None:
+        """Wait for the saves that run during an eval that failed.
+
+        The saves run in threads that cannot be cancelled, so the eval error is raised only after they end.
+        A save error is logged, because the caller raises the eval error.
+        """
+        await asyncio.wait([save_task])
+        if not save_task.cancelled() and save_task.exception() is not None:
+            logger.error(
+                f"Save during the failed eval of step {self.global_step} also failed: {save_task.exception()!r}"
+            )
 
     @staticmethod
     async def _watch_generators_done(

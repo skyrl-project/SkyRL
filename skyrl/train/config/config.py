@@ -1387,6 +1387,13 @@ class FullyAsyncConfig(BaseConfig):
     restores it, so the host needs memory for the KV pools of all inference engines. With ``True``, it
     discards the KV cache, and the inference engines prefill the paused requests again.
     """
+    save_during_eval: bool = False
+    """Run the checkpoint and HF model saves that are due at an eval step while the eval runs. The eval uses the
+    inference engines and the saves use the trainer workers. The next step starts when both end. Defaults to False,
+    which runs the eval first and the saves after it.
+
+    This key does not affect the colocated partial-rollout trainer. That trainer saves before the weight sync, while
+    the inference engines sleep."""
 
     # --- Trainer simulation (no real trainer components) ---
     simulate_training: bool = False
