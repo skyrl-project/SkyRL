@@ -108,6 +108,13 @@ def compute_approx_kl(
         loss_mask: Optional mask over trainable response tokens.
         kl_estimator_type: One of ``k1``, ``abs``, ``k2``, or ``k3``.
     """
+    active_mask = None
+    if loss_mask is not None:
+        # Mask inputs before computing kld so masked nan/inf positions do not leak NaN gradients in backward.
+        active_mask = loss_mask.bool()
+        log_probs = torch.where(active_mask, log_probs, 0.0)
+        log_probs_base = torch.where(active_mask, log_probs_base, 0.0)
+
     if kl_estimator_type == "k1":
         kld = log_probs - log_probs_base
     elif kl_estimator_type == "abs":
@@ -126,10 +133,9 @@ def compute_approx_kl(
     else:
         raise ValueError(f"Invalid KL estimator type: {kl_estimator_type}")
 
-    if loss_mask is not None:
-        # Multiplying by `loss_mask` can leak `nan` from masked positions,
-        # so route masked positions to 0.0 directly while keeping mask scaling elsewhere
-        kld = torch.where(loss_mask.bool(), kld * loss_mask, 0.0)
+    if active_mask is not None:
+        # Route masked positions to 0.0 directly while keeping soft mask scaling elsewhere.
+        kld = torch.where(active_mask, kld * loss_mask, 0.0)
     return kld
 
 
@@ -1191,18 +1197,20 @@ def importance_sampling_loss(
     Returns:
         Tuple of (loss, metrics_dict)
     """
-    # Compute importance ratio: p_theta(x) / q(x)
-    prob_ratio = torch.exp(log_probs - old_log_probs)
-
-    # Importance-weighted policy gradient
-    elementwise_loss = -(prob_ratio * advantages)
-
-    # Apply loss mask and sum (matching Tinker's SUM reduction semantics)
+    # Apply loss mask before exp/multiplication so masked extreme or non-finite values
+    # do not produce NaN losses, metrics, or gradients (matching Tinker's SUM semantics).
     if loss_mask is not None:
+        active = loss_mask.bool()
+        lp = torch.where(active, log_probs, 0.0)
+        old_lp = torch.where(active, old_log_probs, 0.0)
+        adv = torch.where(active, advantages, 0.0)
+        prob_ratio = torch.exp(lp - old_lp)
+        elementwise_loss = -(prob_ratio * adv)
         loss = (elementwise_loss * loss_mask).sum()
-        # Track mean importance ratio for monitoring
-        mean_ratio = (prob_ratio * loss_mask).sum() / loss_mask.sum()
+        mean_ratio = masked_mean(prob_ratio, loss_mask)
     else:
+        prob_ratio = torch.exp(log_probs - old_log_probs)
+        elementwise_loss = -(prob_ratio * advantages)
         loss = elementwise_loss.sum()
         mean_ratio = prob_ratio.mean()
 

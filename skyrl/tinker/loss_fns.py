@@ -30,7 +30,9 @@ def cross_entropy_loss(
     _loss_fn_config: LossFnConfig,
 ) -> jax.Array:
     "Standard cross-entropy loss (i.e., negative log-likelihood)."
-    return -safe_loss_mask(target_logprobs, loss_mask)
+    active = loss_mask != 0.0
+    lp = jnp.where(active, target_logprobs, 0.0)
+    return -safe_loss_mask(lp, loss_mask)
 
 
 def importance_sampling_loss(
@@ -41,8 +43,12 @@ def importance_sampling_loss(
     _loss_fn_config: LossFnConfig,
 ) -> jax.Array:
     "Importance sampling loss with target_logprobs from learner policy and sampling_logprobs from sampling policy."
-    prob_ratio = jnp.exp(target_logprobs - sampling_logprobs)
-    return -safe_loss_mask(prob_ratio * advantages, loss_mask)
+    active = loss_mask != 0.0
+    lp = jnp.where(active, target_logprobs, 0.0)
+    slp = jnp.where(active, sampling_logprobs, 0.0)
+    adv = jnp.where(active, advantages, 0.0)
+    prob_ratio = jnp.exp(lp - slp)
+    return -safe_loss_mask(prob_ratio * adv, loss_mask)
 
 
 def ppo_loss(
@@ -53,12 +59,16 @@ def ppo_loss(
     loss_fn_config: LossFnConfig,
 ) -> jax.Array:
     "PPO style clipped version of the importance sampling loss."
-    prob_ratio = jnp.exp(target_logprobs - sampling_logprobs)
+    active = loss_mask != 0.0
+    lp = jnp.where(active, target_logprobs, 0.0)
+    slp = jnp.where(active, sampling_logprobs, 0.0)
+    adv = jnp.where(active, advantages, 0.0)
+    prob_ratio = jnp.exp(lp - slp)
     clip_low_threshold = loss_fn_config.clip_low_threshold
     clip_high_threshold = loss_fn_config.clip_high_threshold
     clipped_ratio = jnp.clip(prob_ratio, clip_low_threshold, clip_high_threshold)
-    unclipped = prob_ratio * advantages
-    clipped = clipped_ratio * advantages
+    unclipped = prob_ratio * adv
+    clipped = clipped_ratio * adv
     return -safe_loss_mask(jnp.minimum(unclipped, clipped), loss_mask)
 
 
@@ -70,11 +80,15 @@ def cispo_loss(
     loss_fn_config: LossFnConfig,
 ) -> jax.Array:
     "CISPO clipped-ratio policy gradient loss."
-    prob_ratio = jnp.exp(target_logprobs - sampling_logprobs)
+    active = loss_mask != 0.0
+    lp = jnp.where(active, target_logprobs, 0.0)
+    slp = jnp.where(active, sampling_logprobs, 0.0)
+    adv = jnp.where(active, advantages, 0.0)
+    prob_ratio = jnp.exp(lp - slp)
     clip_low_threshold = loss_fn_config.clip_low_threshold
     clip_high_threshold = loss_fn_config.clip_high_threshold
     clipped_ratio = jnp.clip(prob_ratio, clip_low_threshold, clip_high_threshold)
-    cispo_objective = jax.lax.stop_gradient(clipped_ratio) * target_logprobs * advantages
+    cispo_objective = jax.lax.stop_gradient(clipped_ratio) * lp * adv
     return -safe_loss_mask(cispo_objective, loss_mask)
 
 

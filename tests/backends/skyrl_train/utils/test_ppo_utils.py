@@ -98,6 +98,71 @@ def test_compute_approx_kl_applies_loss_mask(kl_estimator_type: str) -> None:
     ), f"{kl_estimator_type}: soft mask scaling not preserved: {kld[:, :3]} vs {expected_kept}"
 
 
+@pytest.mark.parametrize("kl_estimator_type", ["k1", "k2", "k3", "abs"])
+@pytest.mark.parametrize("bad_value", [float("nan"), float("-inf")])
+def test_compute_approx_kl_masked_nonfinite_inputs_keep_gradients_finite(
+    kl_estimator_type: str,
+    bad_value: float,
+) -> None:
+    """Masked positions with nan/-inf inputs must produce zero, finite gradients."""
+    log_probs = torch.tensor([[0.2, 0.3, 0.5, 0.7]], requires_grad=True)
+    log_probs_base = torch.tensor([[0.1, 0.2, 0.4, bad_value]])
+    mask = torch.tensor([[1.0, 0.5, 0.25, 0.0]])
+
+    kld = compute_approx_kl(log_probs, log_probs_base, mask, kl_estimator_type=kl_estimator_type)
+    kld.sum().backward()
+
+    assert torch.isfinite(kld).all()
+    assert log_probs.grad is not None
+    assert torch.isfinite(log_probs.grad).all(), f"{kl_estimator_type}: non-finite grad {log_probs.grad}"
+    assert log_probs.grad[0, 3].item() == 0.0
+
+    ref_lp = log_probs[:, :3].detach().clone().requires_grad_(True)
+    ref_kld = compute_approx_kl(ref_lp, log_probs_base[:, :3], mask[:, :3], kl_estimator_type=kl_estimator_type)
+    ref_kld.sum().backward()
+    torch.testing.assert_close(log_probs.grad[:, :3], ref_lp.grad, atol=1e-6, rtol=1e-6)
+
+
+def test_importance_sampling_loss_masked_extreme_and_all_zero_mask() -> None:
+    """importance_sampling_loss must keep loss, metrics, and gradients finite on masked extreme/empty inputs."""
+    from skyrl.backends.skyrl_train.utils.ppo_utils import importance_sampling_loss
+    from skyrl.train.config import AlgorithmConfig
+
+    log_probs = torch.tensor([[-1.0, -5.0, -10.0]], requires_grad=True)
+    old_log_probs = torch.tensor([[-1.2, -200.0, float("-inf")]])
+    advantages = torch.tensor([[1.5, 0.0, float("nan")]])
+    loss_mask = torch.tensor([[1.0, 0.0, 0.0]])
+
+    loss, metrics = importance_sampling_loss(
+        log_probs, old_log_probs, advantages, AlgorithmConfig(), loss_mask=loss_mask
+    )
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert math.isfinite(metrics["importance_ratio"])
+    assert log_probs.grad is not None
+    assert torch.isfinite(log_probs.grad).all()
+    assert log_probs.grad[0, 1].item() == 0.0
+    assert log_probs.grad[0, 2].item() == 0.0
+
+    expected_ratio = math.exp(-1.0 - (-1.2))
+    assert loss.item() == pytest.approx(-expected_ratio * 1.5, rel=1e-6)
+    assert metrics["importance_ratio"] == pytest.approx(expected_ratio, rel=1e-6)
+    assert log_probs.grad[0, 0].item() == pytest.approx(-expected_ratio * 1.5, rel=1e-6)
+
+    # All-zero mask must not divide by zero in importance_ratio.
+    empty_lp = torch.tensor([[-1.0, -2.0]], requires_grad=True)
+    empty_loss, empty_metrics = importance_sampling_loss(
+        empty_lp,
+        torch.tensor([[-1.0, -2.0]]),
+        torch.tensor([[1.0, 1.0]]),
+        AlgorithmConfig(),
+        loss_mask=torch.zeros(1, 2),
+    )
+    assert empty_loss.item() == 0.0
+    assert empty_metrics["importance_ratio"] == 0.0
+
+
 def test_compute_reinforce_plus_plus_outcome_advantage_returns_and_masking():
     """REINFORCE++ returns should be discounted sums with reset after EOS; advantages masked."""
     token_level_rewards = torch.tensor([[1.0, 2.0, 3.0]])

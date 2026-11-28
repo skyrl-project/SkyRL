@@ -774,3 +774,41 @@ def test_compute_off_policy_correction_with_token_mask():
     torch.testing.assert_close(new_loss_mask, expected_mask)
     assert "token_mask_ratio" in metrics
     assert abs(metrics["token_mask_ratio"] - 1 / 3) < 0.01
+
+
+def test_compute_off_policy_correction_is_ratio_stats_ignore_masked_tokens():
+    """is_ratio_{min,max,std} must be computed over active (loss_mask > 0) tokens only."""
+    config = OffPolicyCorrectionConfig(tis_ratio_type="token")
+
+    # On-policy active tokens (ratio == 1.0) with masked padding tokens carrying extreme drift.
+    old_log_probs = torch.tensor([[-1.0, -1.0, -1.0, -1.0]])
+    rollout_logprobs = torch.tensor([[-1.0, -1.0, -6.0, -0.1]])
+    loss_mask = torch.tensor([[1.0, 1.0, 0.0, 0.0]])
+    _, metrics, _ = compute_off_policy_correction(old_log_probs, rollout_logprobs, loss_mask, config)
+    assert metrics["is_ratio_mean"] == pytest.approx(1.0, abs=1e-6)
+    assert metrics["is_ratio_std"] == pytest.approx(0.0, abs=1e-6)
+    assert metrics["is_ratio_min"] == pytest.approx(1.0, abs=1e-6)
+    assert metrics["is_ratio_max"] == pytest.approx(1.0, abs=1e-6)
+
+    # Non-uniform active tokens: verify min/max/std match active slice exactly.
+    old2 = torch.tensor([[-1.0, -1.5, -0.5, -1.0]])
+    roll2 = torch.tensor([[-1.5, -1.0, -1.5, -10.0]])
+    mask2 = torch.tensor([[1.0, 1.0, 1.0, 0.0]])
+    _, m2, _ = compute_off_policy_correction(old2, roll2, mask2, config)
+    active = torch.exp(old2[:, :3] - roll2[:, :3])
+    assert m2["is_ratio_min"] == pytest.approx(active.min().item(), rel=1e-5)
+    assert m2["is_ratio_max"] == pytest.approx(active.max().item(), rel=1e-5)
+    assert m2["is_ratio_std"] == pytest.approx(active.std().item(), rel=1e-5)
+
+    # Single active token and all-masked edge cases stay finite (no NaN std / empty-tensor crash).
+    _, m_one, _ = compute_off_policy_correction(
+        old_log_probs, rollout_logprobs, torch.tensor([[1.0, 0.0, 0.0, 0.0]]), config
+    )
+    assert m_one["is_ratio_std"] == 0.0
+    assert m_one["is_ratio_min"] == pytest.approx(1.0, abs=1e-6)
+    assert m_one["is_ratio_max"] == pytest.approx(1.0, abs=1e-6)
+
+    _, m_zero, _ = compute_off_policy_correction(old_log_probs, rollout_logprobs, torch.zeros_like(loss_mask), config)
+    assert m_zero["is_ratio_std"] == 0.0
+    assert m_zero["is_ratio_min"] == 0.0
+    assert m_zero["is_ratio_max"] == 0.0
