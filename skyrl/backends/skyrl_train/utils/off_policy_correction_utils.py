@@ -444,9 +444,15 @@ def compute_off_policy_correction(
     is_ratio = safe_exp_delta(old_log_probs - rollout_logprobs, clip=20.0, out_dtype=old_log_probs.dtype)
     metrics = {}
     metrics["is_ratio_mean"] = masked_mean(is_ratio, loss_mask).mean().detach().item()
-    metrics["is_ratio_std"] = (is_ratio * loss_mask).std().detach().item()
-    metrics["is_ratio_max"] = (is_ratio * loss_mask).max().detach().item()
-    metrics["is_ratio_min"] = (is_ratio * loss_mask).min().detach().item()
+    active_ratio = is_ratio[loss_mask > 0]
+    if active_ratio.numel() > 0:
+        metrics["is_ratio_std"] = active_ratio.std().detach().item() if active_ratio.numel() > 1 else 0.0
+        metrics["is_ratio_max"] = active_ratio.max().detach().item()
+        metrics["is_ratio_min"] = active_ratio.min().detach().item()
+    else:
+        metrics["is_ratio_std"] = 0.0
+        metrics["is_ratio_max"] = 0.0
+        metrics["is_ratio_min"] = 0.0
 
     # Optionally apply outlier token mask if enabled
     if apply_outlier_token_mask:
