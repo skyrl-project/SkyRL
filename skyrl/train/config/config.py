@@ -717,6 +717,8 @@ class MegatronConfig(BaseConfig):
     )
     """Pass-through kwargs for Megatron's ``TransformerConfig``:
     https://github.com/NVIDIA/Megatron-LM/blob/core_r0.13.0/megatron/core/transformer/transformer_config.py
+    Each key must be a field of ``TransformerConfig`` or of the model's Megatron-Bridge provider
+    (e.g. ``should_pad_vocab``); any other key raises an error when the model is built.
     Also the place to put HuggingFace config overrides (e.g. ``rope_parameters``) for the Megatron
     backend, where FSDP would use ``model_config_kwargs``.
 
@@ -1382,10 +1384,23 @@ class FullyAsyncConfig(BaseConfig):
     """Indicates whether fully async training is enabled"""
     max_staleness_steps: int = 4
     """Maximum off-policy steps allowed. If a trajectory group is scheduled at step *i* and trained at step *j*,
-    then ``j - i <= max_staleness_steps``. Larger values increase throughput but also off-policy-ness."""
+    then ``j - i <= max_staleness_steps``. Larger values increase throughput but also off-policy-ness.
+
+    The colocated partial-rollout trainer also uses this field for admission. At most
+    ``max(num_parallel_generation_workers, policy_mini_batch_size * (max_staleness_steps + 1))`` groups
+    are not yet trained on. When ``policy_mini_batch_size * (max_staleness_steps + 1)`` is at most
+    ``num_parallel_generation_workers`` (always true for ``0``), a finished group holds its slot until
+    the step that trains on it. When it is larger, a finished group frees its slot at once. That trainer
+    sets no limit on the number of policy versions that generate one trajectory, so it does not guarantee
+    ``j - i <= max_staleness_steps``."""
     num_parallel_generation_workers: int = 768
     """Number of generation workers to spawn. Should be >= ``policy_mini_batch_size`` and
-    <= ``policy_mini_batch_size * (max_staleness_steps + 1)``."""
+    <= ``policy_mini_batch_size * (max_staleness_steps + 1)``.
+
+    For the colocated partial-rollout trainer, this is the number of groups in flight. It must be
+    >= ``policy_mini_batch_size``, and the upper bound does not apply: each step trains on the first
+    ``policy_mini_batch_size`` groups to finish, and the rest stay paused through training and resume
+    under the next policy version."""
     sample_full_batch: bool = False
     """Requires ``zero_variance_filter=True``. Drop zero-variance groups and keep pulling until the
     mini-batch is full of non-zero-variance groups (async-native DAPO ``dynamic_sampling="filter"``).
@@ -1396,6 +1411,11 @@ class FullyAsyncConfig(BaseConfig):
     """Whether or not to clear the KV cache on weight sync. Defaults to False.
     If False, we reuse KV cache from stale policies during generation
     (avoids recomputation at the cost of using slightly stale KV cache).
+
+    The colocated partial-rollout trainer keeps the in-flight requests paused in the inference engines
+    during training. With ``False``, it copies the KV cache to host memory for the training phase and
+    restores it, so the host needs memory for the KV pools of all inference engines. With ``True``, it
+    discards the KV cache, and the inference engines prefill the paused requests again.
     """
 
     # --- Trainer simulation (no real trainer components) ---

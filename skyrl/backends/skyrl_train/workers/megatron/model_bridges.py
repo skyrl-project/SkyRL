@@ -17,7 +17,6 @@ try:
     from megatron.bridge.models.conversion.utils import moe_experts_stored_packed
     from megatron.bridge.models.deepseek.common import get_common_mapping_list
     from megatron.bridge.models.deepseek.deepseek_v3_bridge import DeepSeekV3Bridge
-    from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
     from megatron.bridge.models.qwen.qwen35_bridge import Qwen35Bridge, Qwen35MoEBridge
     from megatron.core.models.gpt.gpt_model import GPTModel
 
@@ -32,54 +31,6 @@ try:
     # Qwen3.8-Flash-Next (qwen4_exp): GDN/gated-attention MoE with gated low-rank hyper-connections
     # and a PLE n-gram embedding. Importing registers ``Qwen4ExpForConditionalGeneration`` -> GPTModel.
     import skyrl.backends.skyrl_train.patches.megatron.qwen4_exp.bridge  # noqa: F401
-
-    @MegatronModelBridge.register_bridge(
-        source="Glm4MoeLiteForCausalLM",
-        target=GPTModel,
-    )
-    class GLM47FlashBridge(DeepSeekV3Bridge):
-        """Bridge for GLM-4.7-Flash (Glm4MoeLiteForCausalLM).
-
-        GLM-4.7-Flash is architecturally identical to DeepSeek-V3 (MLA + MoE)
-        but its HF config differs in rope_scaling format:
-        - DeepSeek: rope_scaling has factor/mscale/mscale_all_dim, top-level rope_theta
-        - GLM-4.7-Flash: rope_scaling has rope_theta/rope_type, no mscale fields
-
-        We reuse DeepSeekV3Bridge.provider_bridge() (which sets all critical
-        TP/MoE/MLA provider attributes) by temporarily normalizing the HF config
-        rope fields so the base CONFIG_MAPPING can handle them.
-        """
-
-        def provider_bridge(self, hf_pretrained: PreTrainedCausalLM):
-            hf_config = hf_pretrained.config
-
-            # GLM-4.7-Flash stores rope_theta inside rope_scaling dict and
-            # doesn't have factor/mscale/mscale_all_dim.  Normalize to the
-            # format DeepSeekV3Bridge (and its CONFIG_MAPPING) expects.
-            orig_rope_scaling = hf_config.rope_scaling
-            orig_rope_theta = getattr(hf_config, "rope_theta", None)
-            rope_theta = orig_rope_scaling.get("rope_theta", 10000.0) if orig_rope_scaling else 10000.0
-            hf_config.rope_scaling = None
-            hf_config.rope_theta = rope_theta
-
-            try:
-                provider = super().provider_bridge(hf_pretrained)
-            finally:
-                hf_config.rope_scaling = orig_rope_scaling
-                if orig_rope_theta is None and hasattr(hf_config, "rope_theta"):
-                    delattr(hf_config, "rope_theta")
-                else:
-                    hf_config.rope_theta = orig_rope_theta
-
-            provider.moe_router_score_function = "sigmoid"
-            # NOTE: MTP is now honored. DeepSeekV3Bridge.provider_bridge already sets
-            # provider.mtp_num_layers from hf_config.num_nextn_predict_layers, and
-            # megatron-bridge's get_common_mapping_list emits the MTP weight mappings
-            # (enorm/hnorm/eh_proj/shared_head.* + nextn transformer layers) for HF
-            # round-tripping. SkyRL's MegatronWorker.init_configs can still override
-            # provider.mtp_num_layers via policy.megatron_config.mtp_num_layers (e.g.
-            # set it to 0 to force-disable, or leave None to use the model default).
-            return provider
 
     # Qwen3.5 (language-model-only) -> GPTModel.
     #

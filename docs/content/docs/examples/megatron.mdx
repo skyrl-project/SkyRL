@@ -36,7 +36,7 @@ All statistics shown were averaged over the first 10 steps of training. Micro ba
 
 A script for running the Qwen3-30B-A3B experiment can be found [here](https://github.com/NovaSky-AI/SkyRL/blob/main/examples/train/megatron/run_search_megatron.sh).
 Additionally, we provide a script for running basic GSM8K training on Qwen3-235B-A22B with Megatron [here](https://github.com/NovaSky-AI/SkyRL/blob/main/examples/train/megatron/run_megatron_qwen3-235b-a22b.sh). 
-Note that although training at 100B+ scale using Megatron is currently possible, we are in the process of further optimizing peformance.
+Note that although training at 100B+ scale using Megatron is currently possible, we are in the process of further optimizing performance.
 
 For more details on configuring the Megatron backend, and enabling checkpointing, see the [configuration API reference](/docs/api-ref/skyrl/config), and the [Megatron checkpointing guide](../checkpointing-logging/checkpointing#megatron-checkpointing).
 
@@ -44,7 +44,7 @@ For more details on configuring the Megatron backend, and enabling checkpointing
 
 ### Setting up the Docker image
 
-To get started, you can follow the instructions for installing via Docker in the [Installation Guide](../getting-started/installation) page, but using the `novaskyai/skyrl-train-ray-2.57.0-py3.12-cu13.0-megatron` image instead of the default image.
+To get started, you can follow the instructions for installing via Docker in the [Installation Guide](../getting-started/installation) page, but using the `novaskyai/skyrl-train-ray-2.60.1-py3.12-cu13.0-megatron` image instead of the default image.
 
 This ensures that the necessary dependencies needed for Megatron are installed and don't need to be built on each node for each run, which can be time consuming. Previously, we recommended setting PYTHONPATH to the location of TransformerEngine installation, but this is no longer necessary.
 
